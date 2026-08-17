@@ -25,6 +25,10 @@ services:
       - PIPELINE_LIMIT=${PIPELINE_LIMIT:-}
       - PIPELINE_COUNTRY=${PIPELINE_COUNTRY:-}
       - PIPELINE_WORKERS=${PIPELINE_WORKERS:-4}
+      # e.g. PIPELINE_STAGES=text,ai to skip promotion and only re-process
+      # rows already in drug.products
+      - PIPELINE_STAGES=${PIPELINE_STAGES:-}
+      - PROMOTE_BATCH_SIZE=${PROMOTE_BATCH_SIZE:-200}
     # networks:
     #   - default
     #   - source_information_shared

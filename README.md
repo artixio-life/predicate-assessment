@@ -68,6 +68,20 @@ python main.py         # or: docker compose up
 `PIPELINE_LIMIT` caps rows per stage, `PIPELINE_COUNTRY` scopes to one
 country, `PIPELINE_WORKERS` sets concurrency (default 4).
 
+**Running only some stages.** `PIPELINE_STAGES` selects which of the three
+run — useful to stop promoting new raw records and only re-process rows that
+are already in `drug.products` (e.g. after changing the extraction prompt):
+
+```bash
+PIPELINE_STAGES=text,ai   python main.py   # skip promotion
+PIPELINE_STAGES=ai        python main.py   # AI extraction only
+```
+
+Unset means all three. Note the stages are still gated by row status, so
+`PIPELINE_STAGES=ai` only touches rows sitting at
+`processing_status='PARSED'` + `ai_extraction_status='PENDING'` — reset a row
+first if you want it re-extracted.
+
 ## Out of scope (for now)
 
 - The larger column backlog in source-predicate's `smpc_extraction_gap_analysis.md`

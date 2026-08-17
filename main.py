@@ -22,7 +22,8 @@ def main():
     limit = int(limit_env) if limit_env else None
     country = os.getenv("PIPELINE_COUNTRY") or None
     workers = int(os.getenv("PIPELINE_WORKERS", "4"))
-    runner.run(limit=limit, country=country, workers=workers)
+    stages = runner.parse_stages(os.getenv("PIPELINE_STAGES"))
+    runner.run(limit=limit, country=country, workers=workers, stages=stages)
 
 
 if __name__ == "__main__":
