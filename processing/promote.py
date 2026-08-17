@@ -90,7 +90,8 @@ def guess_registration_number(json_data):
 
 
 def _claim_raw_records(cursor, country=None, exclude_ids=None,
-                        shard_index=None, shard_count=None, batch_size=1):
+                        shard_index=None, shard_count=None, batch_size=1,
+                        after_id=0):
     """
     `exclude_ids` is the run's set of raw records that already failed to
     promote. It is REQUIRED to avoid an infinite loop: the claim holds only a
@@ -107,6 +108,15 @@ def _claim_raw_records(cursor, country=None, exclude_ids=None,
     concurrent workers repeatedly landed on the same lowest-id row and burned an
     attempt discovering it was already promoted. Sharding removes the contention
     by construction rather than relying on that timing.
+
+    `after_id` is the worker's high-water mark and is what keeps this linear.
+    Without it, `WHERE p.id IS NULL ORDER BY r.id LIMIT n` has to walk past
+    every already-promoted row to reach the next unpromoted one, so batch k
+    re-scans everything batches 1..k-1 already covered — quadratic, and very
+    slow once the table is large. Because rows are always taken in ascending
+    id order and a processed row never becomes claimable again within a run
+    (it is either promoted, or recorded in exclude_ids), everything at or
+    below the mark can be skipped outright.
     """
     query = """
         SELECT r.id, r.name, r.country_id, r.document_url, r.json_data
@@ -116,6 +126,9 @@ def _claim_raw_records(cursor, country=None, exclude_ids=None,
         WHERE p.id IS NULL
     """
     params = []
+    if after_id:
+        query += " AND r.id > %s"
+        params.append(after_id)
     if country:
         query += " AND c.name = %s"
         params.append(country)
@@ -239,6 +252,9 @@ def _worker(shard_index, shard_count, country, remaining, remaining_lock,
     """
     conn = get_db_connection()
     stats = {"promoted": 0, "duplicate": 0, "failed": 0}
+    # High-water mark: this worker never looks at ids <= watermark again. Keeps
+    # the claim scan linear instead of quadratic (see _claim_raw_records).
+    watermark = 0
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             geo_cache = load_geography_cache(cur)
@@ -252,13 +268,13 @@ def _worker(shard_index, shard_count, country, remaining, remaining_lock,
                         break
                     batch_size = min(batch_size, remaining[0])
             with failed_lock:
-                skip_ids = set(failed_ids)
+                skip_ids = {i for i in failed_ids if i > watermark}
 
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 raw_records = _claim_raw_records(
                     cur, country=country, exclude_ids=skip_ids,
                     shard_index=shard_index, shard_count=shard_count,
-                    batch_size=batch_size,
+                    batch_size=batch_size, after_id=watermark,
                 )
                 if not raw_records:
                     conn.commit()
@@ -290,6 +306,9 @@ def _worker(shard_index, shard_count, country, remaining, remaining_lock,
                         f"raw_record={raw_records[0]['id']} failed "
                         f"(not retried this run): {e}"
                     )
+            # Advance past everything just handled, whether promoted, skipped
+            # as a duplicate, or failed — none of it is claimable again.
+            watermark = max(r['id'] for r in raw_records)
             if remaining is not None:
                 with remaining_lock:
                     remaining[0] -= len(raw_records)
