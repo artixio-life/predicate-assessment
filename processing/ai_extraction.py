@@ -5,8 +5,15 @@ Feeds a product's chunks (source.product_chunks, in order) to the LLM one
 at a time. Each call is shown the JSON accumulated from every prior chunk
 and asked to return the complete, updated object — not a diff — so the
 result after the last chunk is the merged extraction across the whole
-document. A product with no document (registry-only source) runs the same
-fold over a single synthetic "chunk" made from its json_data.
+document. The crawler's raw json_data (application details, product
+tables, approval history, therapeutic equivalents, ...) is always folded
+in too, chunked the same way as document text — not only as a
+registry-only fallback when there's no document at all, but as extra
+context alongside document_text whenever both exist (see
+schema/schema.sql's json_data comment). Document prose often doesn't
+restate structured facts like application numbers or approval dates, so
+skipping json_data whenever a document was present used to silently drop
+real signal.
 
 Two things get written per product:
 - the flat `columns` on drug.products itself (brand_name, mah_name,
@@ -39,6 +46,7 @@ from openai import OpenAI
 from psycopg2.extras import Json, RealDictCursor
 
 from db import get_db_connection
+from processing.chunking import DEFAULT_TARGET_TOKENS, count_tokens
 from processing.claim import claim_ai_extraction
 from processing.json_utils import parse_llm_json, JsonParseError
 from processing.retry import run_with_retries, RetriesExhausted
@@ -260,8 +268,11 @@ contraindications) — prefer these over routine/common ADRs like headache or na
 is correct and expected to drop a previously-listed lower-severity risk once 8 more \
 important ones are known, even though that means shortening the list.
 - If this excerpt has nothing relevant, return the JSON unchanged.
-- If the input is a single JSON blob of raw registry metadata rather than document \
-prose, extract from whatever fields are present the same way.
+- Some excerpts are a JSON blob of raw registry metadata (application details, product \
+tables, approval history, therapeutic equivalents, ...) rather than document prose — \
+these may appear before, after, or interleaved with document excerpts for the same \
+product. Extract from whatever fields are present the same way regardless of which \
+form an excerpt takes.
 - Respond with ONLY the JSON object. No markdown fences, no commentary.
 """
 
@@ -312,20 +323,107 @@ def _call_llm_merge(product, accumulated, batch_texts, batch_start, batch_end, t
     return parsed
 
 
+def _flatten_json_fields(data, prefix=""):
+    """
+    Walk a nested dict, yielding (dotted.path, value) for every leaf that is
+    either a scalar or a non-empty list. Nested dicts (e.g. a crawler's
+    approval_history: {original_approvals: [...], supplements: [...]}) are
+    descended into rather than treated as one opaque leaf, so each of their
+    list-valued fields packs independently below.
+    """
+    for key, value in (data or {}).items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            yield from _flatten_json_fields(value, path)
+        elif value not in (None, [], {}, ""):
+            yield path, value
+
+
+def _pack_list_field(path, items, target_tokens=DEFAULT_TARGET_TOKENS):
+    """
+    Greedily pack a list field's items into ~target_tokens-sized groups —
+    the same greedy-packing idea as chunk_text's paragraph packing, just
+    keyed on list items instead of paragraphs. Needed because chunk_text
+    itself doesn't work on pretty-printed JSON: it has no blank-line
+    paragraph breaks for chunk_text's normal split, and no sentence-ending
+    punctuation for its oversized-paragraph fallback to find, so a large
+    array-shaped json_data (a crawler's products/documents/approval_history
+    entries) would otherwise come back as a single unsplit multi-thousand-
+    token blob — confirmed live against a 400-entry synthetic payload before
+    this function existed.
+    """
+    groups, current, current_tokens, start = [], [], 0, 1
+    for i, item in enumerate(items, start=1):
+        text = json.dumps(item, ensure_ascii=False, default=str)
+        tokens = count_tokens(text)
+        if current and current_tokens + tokens > target_tokens:
+            groups.append((start, i - 1, current))
+            current, current_tokens, start = [], 0, i
+        current.append(text)
+        current_tokens += tokens
+    if current:
+        groups.append((start, len(items), current))
+
+    return [
+        f"Raw structured registry metadata — {path} (items {s}-{e} of {len(items)}):\n"
+        f"[{', '.join(chunk_items)}]"
+        for s, e, chunk_items in groups
+    ]
+
+
+def _json_data_units(product):
+    """
+    Split product['json_data'] into one or more chunk-sized text units: one
+    "summary" unit of every scalar field (application_number, company,
+    source_url, ...), plus one or more units per list-valued field
+    (products, documents, approval_history.original_approvals, ...), each
+    itself packed to ~DEFAULT_TARGET_TOKENS via _pack_list_field. This is
+    what makes a large json_data blob actually get chunked, unlike naively
+    reusing chunk_text on the whole serialized JSON (see _pack_list_field).
+    """
+    json_data = product.get("json_data")
+    if not json_data:
+        return []
+
+    scalars = {}
+    units = []
+    for path, value in _flatten_json_fields(json_data):
+        if isinstance(value, list):
+            units.extend(_pack_list_field(path, value))
+        else:
+            scalars[path] = value
+
+    if scalars:
+        units.insert(
+            0,
+            "Raw structured registry metadata (application/product summary):\n"
+            + json.dumps(scalars, ensure_ascii=False, default=str, indent=2),
+        )
+    if not units:
+        # json_data had only empty/falsy values under _flatten_json_fields'
+        # filter — fall back to dumping it whole rather than silently
+        # dropping it (still tiny by construction, since anything
+        # substantial would have been caught above).
+        units.append(
+            "Raw structured registry metadata:\n"
+            + json.dumps(json_data, ensure_ascii=False, default=str, indent=2)
+        )
+    return units
+
+
 def _input_units(cursor, product):
     cursor.execute(
         "SELECT chunk_text FROM drug.product_chunks WHERE product_id = %s ORDER BY chunk_index",
         (product["id"],),
     )
-    chunks = [row["chunk_text"] for row in cursor.fetchall()]
-    if chunks:
-        return chunks
-    if product.get("json_data"):
-        return [
-            "Raw structured registry metadata (no source document text available):\n"
-            + json.dumps(product["json_data"], ensure_ascii=False, default=str)
-        ]
-    return []
+    document_chunks = [row["chunk_text"] for row in cursor.fetchall()]
+
+    # json_data goes first: it's the structured "skeleton" (application
+    # number, product table, approval dates, TE cross-references) that
+    # document prose often doesn't restate, so the fold sees it before the
+    # narrative detail in document_chunks. Included whenever present, not
+    # only when document_chunks is empty — see module docstring.
+    return _json_data_units(product) + document_chunks
 
 
 def _persist(cursor, product_id, accumulated, ai_status, attempts, error_summary, processing_status):

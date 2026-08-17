@@ -31,16 +31,17 @@ logger = logging.getLogger(__name__)
 # (fsync) that dominated Stage A's runtime.
 BATCH_SIZE = int(os.getenv("PROMOTE_BATCH_SIZE", "200"))
 
-# Best-effort registration-number lookup across the 5 crawlers' differing
+# Best-effort registration-number lookup across the 6 crawlers' differing
 # json_data shapes (checked against each crawler's actual field names):
 #   Brazil (ANVISA):        numeroRegistro
 #   South Africa (SAHPRA):  detail.registration_number, else application_no
 #   Australia (TGA):        artg_id
 #   China (NMPA):           acceptance_no
+#   United States (FDA):    application_number (the ApplNo, e.g. "020892")
 #   United Kingdom (MHRA):  not captured yet (dedup is by name only) -> None
 _TOP_LEVEL_KEYS = (
     'registration_number', 'numeroRegistro', 'artg_id', 'acceptance_no',
-    'application_no', 'reg_number', 'license_number', 'pl_number',
+    'application_no', 'application_number', 'reg_number', 'license_number', 'pl_number',
 )
 
 

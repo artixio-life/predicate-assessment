@@ -27,6 +27,13 @@ def _count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def count_tokens(text: str) -> int:
+    """Public wrapper around `_count_tokens`, for callers outside this module
+    that need to size their own content the same way (e.g. ai_extraction.py
+    packing json_data's list-valued fields into chunk-sized groups)."""
+    return _count_tokens(text)
+
+
 def _normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)

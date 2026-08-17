@@ -25,7 +25,12 @@ source.drug_predicate_raw_records   (source-predicate)
 ```
 
 Products with no document to OCR (registry-only sources) skip Stage B and
-run Stage C directly off their carried-forward `json_data`.
+run Stage C directly off their carried-forward `json_data`. Products that
+*do* have a document still get their `json_data` folded in alongside the
+document's chunks (both are chunked the same way) — a crawler's structured
+fields (application number, product table, approval history, TE
+cross-references, ...) are often not restated anywhere in the document's
+prose, so this isn't only a no-document fallback.
 
 ## Status tracking
 
