@@ -138,9 +138,17 @@ legal/dispensing status here (prescription-only, restricted-to-hospitals, OTC, e
 there is no field for that in this schema, so that information is simply not captured). \
 The mere existence of a currently-published label does NOT prove Active — leave null \
 unless the document says so directly."|null,
-    "registration_date": "YYYY-MM-DD, ONLY if explicitly stated — do not infer from a \
-label revision/publication date"|null,
-    "approval_date": "YYYY-MM-DD, same caution as registration_date"|null,
+    "registration_date": "YYYY-MM-DD — when the product/entry was first registered or \
+listed with the regulator. Regulators label this differently; map ANY of these to this \
+field: 'ARTG Start Date' or 'Start Date' (Australia TGA), 'Date Registered' (South \
+Africa SAHPRA), or an equivalent 'registered on'/'listed since' date under any other \
+label. Fill it whenever ONE of these is explicitly stated — do not infer from a label \
+revision, publication, or document-generation date/timestamp (e.g. a PDF footer's \
+'Produced at' date is NEVER this field, and is not the same event as registration)"|null,
+    "approval_date": "YYYY-MM-DD — when the regulator approved the product, e.g. an \
+'Action Date' whose 'Action Type' is Approval (US FDA's ORIG-1/original approval row), \
+or any other explicit approval-action date. Same caution as registration_date: never \
+infer from a label revision, publication, or document-generation date"|null,
     "market_authorization_date": "YYYY-MM-DD"|null, "expiry_date": "YYYY-MM-DD"|null,
     "withdrawal_date": "YYYY-MM-DD"|null, "label_revision_date": "YYYY-MM-DD"|null,
     "atc_code": str|null,
