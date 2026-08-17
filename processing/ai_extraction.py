@@ -100,8 +100,17 @@ Output JSON must have exactly two top-level keys, "columns" and "product_data":
     "generic_name": "the INN/base substance name — same base form as active_ingredients \
 below, e.g. 'Ondansetron', NOT the salt form 'Ondansetron hydrochloride dihydrate' (the \
 salt belongs in product_data.substance.salt_form instead)"|null,
-    "mah_name": str|null, "mah_address": str|null,
-    "manufacturer": str|null, "manufacturer_address": str|null,
+    "mah_name": str|null,
+    "mah_address": "the address rendered in ENGLISH: translate the generic/structural \
+words (Av./Avenida -> Avenue, Rua -> Street, andar -> Floor, Bairro -> District, 区 -> \
+District, 市 -> City) and transliterate any non-Latin script, but keep PROPER NOUNS as \
+they are — street, district, city and state names are not translated ('Av. Brigadeiro \
+Faria Lima, 201 - 1º ao 4º andar, São Paulo - SP' -> 'Brigadeiro Faria Lima Avenue 201, \
+1st to 4th Floor, São Paulo - SP, Brazil'). Append the country in English if the \
+document makes it clear. Keep numbers, unit/floor designators and postal codes exactly \
+as given"|null,
+    "manufacturer": str|null,
+    "manufacturer_address": "same English rendering rules as mah_address"|null,
     "registration_number": str|null,
     "product_type": "the regulator's OWN registration/product classification, TRANSLATED \
 to English (e.g. Brazil's 'Medicamento Similar' -> 'Similar Medicine', not left in \
@@ -173,12 +182,16 @@ are DIFFERENT fields serving different purposes — fill both.
 LANGUAGE: this database is cross-country, so every value must be in English for \
 uniformity — indications, adverse_reactions, key_risks, contraindications, warnings, \
 product_type/registration_class, symptoms, therapeutic_areas, dosage_forms, routes, \
-substance/moa/target, everything. Translate rather than copy the source language \
-verbatim (e.g. Portuguese "Medicamento Similar" -> "Similar Medicine", not left as-is).
+substance/moa/target, mah_address, manufacturer_address, everything. Translate rather \
+than copy the source language verbatim (e.g. Portuguese "Medicamento Similar" -> \
+"Similar Medicine", not left as-is). Default to English whenever there is any doubt; \
+only the short list below is exempt.
 Exceptions — these stay exactly as printed in the source document, NEVER translated:
   - brand_name_local (the whole point of this field is the original script/spelling)
-  - mah_name, manufacturer (legal entity names are not translated)
-  - mah_address, manufacturer_address (postal addresses must stay usable/lookupable as printed)
+  - mah_name, manufacturer (registered legal entity names — 'Aché Laboratórios \
+Farmacêuticos S.A.' stays as-is, it is the company's actual legal name, not prose. For \
+a non-Latin-script company give the officially-used English/romanised name when the \
+document itself provides one, otherwise leave the original)
   - registration_number, atc_code (identifiers/codes, not language content)
   - source_language (this field's VALUE is an ISO code like "pt", describing the \
 document's original language — it is metadata, not something to translate)
