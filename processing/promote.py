@@ -16,16 +16,20 @@ correctness net — even in the rare case both got past the lock, only one
 INSERT actually lands.
 """
 import logging
+import os
 import threading
 
-from psycopg2.errors import UniqueViolation
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import Json, RealDictCursor, execute_values
 
 from db import get_db_connection
-from processing.geography import resolve_geography_id
 from processing.workers import run_worker_pool
 
 logger = logging.getLogger(__name__)
+
+# Rows claimed and inserted per round trip. Promotion is a plain INSERT with no
+# external calls, so batching is nearly free and removes the per-row commit
+# (fsync) that dominated Stage A's runtime.
+BATCH_SIZE = int(os.getenv("PROMOTE_BATCH_SIZE", "200"))
 
 # Best-effort registration-number lookup across the 5 crawlers' differing
 # json_data shapes (checked against each crawler's actual field names):
@@ -85,8 +89,8 @@ def guess_registration_number(json_data):
     return None
 
 
-def _claim_one_raw_record(cursor, country=None, exclude_ids=None,
-                           shard_index=None, shard_count=None):
+def _claim_raw_records(cursor, country=None, exclude_ids=None,
+                        shard_index=None, shard_count=None, batch_size=1):
     """
     `exclude_ids` is the run's set of raw records that already failed to
     promote. It is REQUIRED to avoid an infinite loop: the claim holds only a
@@ -121,116 +125,174 @@ def _claim_one_raw_record(cursor, country=None, exclude_ids=None,
     if exclude_ids:
         query += " AND r.id <> ALL(%s)"
         params.append(list(exclude_ids))
-    query += " ORDER BY r.id FOR UPDATE OF r SKIP LOCKED LIMIT 1"
+    query += " ORDER BY r.id FOR UPDATE OF r SKIP LOCKED LIMIT %s"
+    params.append(batch_size)
     cursor.execute(query, tuple(params))
-    return cursor.fetchone()
+    return cursor.fetchall()
 
 
-def _regulator_for_geography(cursor, geography_id):
-    """The resolved drug.regulatory_geography row already carries the
-    authoritative agency acronym (FDA, ANVISA, TGA, ...) — pull it here
-    rather than asking the AI extraction stage to guess it from prose."""
-    if geography_id is None:
-        return None
+def load_geography_cache(cursor):
+    """
+    Resolve EVERY source.country -> (drug.regulatory_geography.id, agency_acronym)
+    in one query pair, up front.
+
+    This used to be 4 queries per promoted row (3 inside resolve_geography_id,
+    1 for the agency acronym) — but there are only a few dozen countries, and
+    the mapping cannot change mid-run, so per-row lookups were pure overhead
+    and the dominant cost of Stage A. Matching happens here in Python to keep
+    the exact ISO-code-then-name precedence resolve_geography_id used.
+    """
+    cursor.execute("SELECT id, name, code FROM source.country")
+    countries = cursor.fetchall()
     cursor.execute(
-        "SELECT agency_acronym FROM drug.regulatory_geography WHERE id = %s",
-        (geography_id,),
+        "SELECT id, country_name, country_code, agency_acronym FROM drug.regulatory_geography"
     )
-    row = cursor.fetchone()
-    return row["agency_acronym"] if row else None
+    geographies = cursor.fetchall()
+
+    by_code, by_name = {}, {}
+    for g in geographies:
+        if g["country_code"]:
+            by_code.setdefault(g["country_code"].strip().upper(), g)
+        if g["country_name"]:
+            by_name.setdefault(g["country_name"].strip().upper(), g)
+
+    cache, unresolved = {}, []
+    for c in countries:
+        match = None
+        if c["code"]:
+            match = by_code.get(c["code"].strip().upper())
+        if match is None and c["name"]:
+            match = by_name.get(c["name"].strip().upper())
+        if match is None:
+            unresolved.append(c["name"])
+            cache[c["id"]] = (None, None)
+        else:
+            cache[c["id"]] = (match["id"], match["agency_acronym"])
+
+    if unresolved:
+        logger.warning(
+            f"[promote] no drug.regulatory_geography match for: {sorted(unresolved)} "
+            f"— products from these countries promote with country_id NULL "
+            f"and processing_status NEEDS_REVIEW"
+        )
+    logger.info(f"[promote] geography cache: {len(cache)} country/countries resolved once")
+    return cache
 
 
-def _promote_one(cursor, raw_record):
-    geography_id = resolve_geography_id(cursor, raw_record['country_id'])
-    regulator = _regulator_for_geography(cursor, geography_id)
+def _row_values(raw_record, geo_cache):
+    """Build the INSERT tuple for one raw record. No queries — everything it
+    needs is either on the record or in the pre-loaded geography cache."""
+    geography_id, regulator = geo_cache.get(raw_record['country_id'], (None, None))
     document_urls = raw_record['document_url'] or []
     source_url = document_urls[0] if document_urls else None
     json_data = raw_record['json_data']
-    registration_number = guess_registration_number(json_data)
     # No geography match is a review signal, not a blocker — the row still
     # promotes so text/AI extraction can proceed independently of it.
     processing_status = 'PENDING' if geography_id is not None else 'NEEDS_REVIEW'
+    return (
+        raw_record['id'], raw_record['name'], geography_id, regulator, source_url,
+        Json(json_data) if json_data is not None else None,
+        guess_registration_number(json_data), processing_status,
+    )
 
-    cursor.execute(
+
+def _promote_batch(cursor, raw_records, geo_cache):
+    """
+    Insert a whole batch in ONE statement, returning the raw_record_ids that
+    actually landed.
+
+    `ON CONFLICT DO NOTHING` with no conflict target absorbs BOTH unique
+    constraints — uq_products_raw_record (already promoted) and
+    uq_products_country_regnum (a sibling raw record described the same
+    product). Both are routine skips rather than errors, so letting Postgres
+    drop them means the batch never aborts and no per-row exception handling
+    or SAVEPOINT is needed.
+    """
+    values = [_row_values(r, geo_cache) for r in raw_records]
+    rows = execute_values(
+        cursor,
         """
         INSERT INTO drug.products
             (raw_record_id, product_name, country_id, regulator, source_url, json_data,
              registration_number, processing_status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (raw_record_id) DO NOTHING
-        RETURNING id
+        VALUES %s
+        ON CONFLICT DO NOTHING
+        RETURNING raw_record_id, id
         """,
-        (
-            raw_record['id'], raw_record['name'], geography_id, regulator, source_url,
-            Json(json_data) if json_data is not None else None,
-            registration_number, processing_status,
-        ),
+        values,
+        fetch=True,
     )
-    return cursor.fetchone()
+    return {row["raw_record_id"]: row["id"] for row in rows}
 
 
 def _worker(shard_index, shard_count, country, remaining, remaining_lock,
             failed_ids, failed_lock):
     """
-    One worker's claim loop: keeps claiming and promoting raw records until
-    none are left (or `remaining` runs out). Each claim+promote is one short
-    transaction — promotion is a single fast INSERT, no slow external calls,
-    so there is no retry-across-an-open-transaction here.
+    One worker's claim loop, working a BATCH at a time: claim up to
+    BATCH_SIZE rows from this worker's shard, insert them in one statement,
+    commit once. That is 2 round trips and 1 fsync per batch instead of ~6
+    queries + 1 fsync per row.
 
-    A failed row is added to `failed_ids` (shared by every worker in the run)
-    and excluded from subsequent claims. Without that the loop never
-    terminates — see _claim_one_raw_record's docstring.
+    A batch that fails outright is added to `failed_ids` (shared by every
+    worker) and excluded from later claims. Without that the loop never
+    terminates — see _claim_raw_records's docstring.
     """
     conn = get_db_connection()
     stats = {"promoted": 0, "duplicate": 0, "failed": 0}
     try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            geo_cache = load_geography_cache(cur)
+            conn.commit()
+
         while True:
+            batch_size = BATCH_SIZE
             if remaining is not None:
                 with remaining_lock:
                     if remaining[0] <= 0:
                         break
+                    batch_size = min(batch_size, remaining[0])
             with failed_lock:
                 skip_ids = set(failed_ids)
+
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                raw_record = _claim_one_raw_record(
+                raw_records = _claim_raw_records(
                     cur, country=country, exclude_ids=skip_ids,
                     shard_index=shard_index, shard_count=shard_count,
+                    batch_size=batch_size,
                 )
-                if not raw_record:
+                if not raw_records:
                     conn.commit()
                     break
                 try:
-                    result = _promote_one(cur, raw_record)
+                    promoted = _promote_batch(cur, raw_records, geo_cache)
                     conn.commit()
-                    if result:
-                        stats["promoted"] += 1
-                        logger.info(f"[promote] raw_record={raw_record['id']} -> product={result['id']}")
-                    else:
-                        logger.info(f"[promote] raw_record={raw_record['id']} already promoted (race), skipping")
-                except UniqueViolation:
-                    # A sibling raw record describing the SAME product was already
-                    # promoted — crawlers can emit the same product twice (observed
-                    # for SAHPRA, where application_no is duplicated despite being
-                    # its dedup key). One drug.products row per real product is the
-                    # wanted outcome, so this is a routine skip, not a failure.
-                    conn.rollback()
-                    stats["duplicate"] += 1
-                    with failed_lock:
-                        failed_ids.add(raw_record['id'])
+                    # Anything not returned by the INSERT hit ON CONFLICT DO
+                    # NOTHING: already promoted, or a sibling raw record already
+                    # covered the same product. Either way it must not be re-claimed.
+                    skipped = [r['id'] for r in raw_records if r['id'] not in promoted]
+                    stats["promoted"] += len(promoted)
+                    stats["duplicate"] += len(skipped)
+                    if skipped:
+                        with failed_lock:
+                            failed_ids.update(skipped)
                     logger.info(
-                        f"[promote] raw_record={raw_record['id']} skipped: another raw record "
-                        f"already produced the product for registration_number="
-                        f"{guess_registration_number(raw_record['json_data'])!r}"
+                        f"[promote] shard {shard_index}/{shard_count}: batch of "
+                        f"{len(raw_records)} -> {len(promoted)} promoted, "
+                        f"{len(skipped)} already covered"
                     )
                 except Exception as e:
                     conn.rollback()
-                    stats["failed"] += 1
+                    stats["failed"] += len(raw_records)
                     with failed_lock:
-                        failed_ids.add(raw_record['id'])
-                    logger.error(f"[promote] raw_record={raw_record['id']} failed (will not be retried this run): {e}")
+                        failed_ids.update(r['id'] for r in raw_records)
+                    logger.error(
+                        f"[promote] batch of {len(raw_records)} starting at "
+                        f"raw_record={raw_records[0]['id']} failed "
+                        f"(not retried this run): {e}"
+                    )
             if remaining is not None:
                 with remaining_lock:
-                    remaining[0] -= 1
+                    remaining[0] -= len(raw_records)
     finally:
         conn.close()
     return stats
