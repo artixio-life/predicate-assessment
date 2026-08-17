@@ -1,0 +1,35 @@
+version: '3.8'
+
+# This repo does not run its own Postgres or MinIO — it points at the same
+# shared instances as source-predicate (the crawler, owns
+# source.drug_predicate_raw_records) and regulatory-explorer (owns the
+# drug schema, including drug.regulatory_geography). Use the same
+# POSTGRES_*/MINIO_* values as those repos' .env files.
+services:
+  pipeline:
+    build: .
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST:-host.docker.internal}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-drug-predicate-documents}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - MISTRAL_OCR_MODEL=${MISTRAL_OCR_MODEL:-mistral-ocr-latest}
+      - OPEN_ROUTER_API_KEY=${OPEN_ROUTER_API_KEY:-}
+      - EXTRACTOR_MODEL=${EXTRACTOR_MODEL:-openai/gpt-5.6-luna}
+      - PIPELINE_LIMIT=${PIPELINE_LIMIT:-}
+      - PIPELINE_COUNTRY=${PIPELINE_COUNTRY:-}
+      - PIPELINE_WORKERS=${PIPELINE_WORKERS:-4}
+    # networks:
+    #   - default
+    #   - source_information_shared
+
+# networks:
+#   source_information_shared:
+#     external: true
+#     name: source-information_default
