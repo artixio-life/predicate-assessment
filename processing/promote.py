@@ -85,7 +85,8 @@ def guess_registration_number(json_data):
     return None
 
 
-def _claim_one_raw_record(cursor, country=None, exclude_ids=None):
+def _claim_one_raw_record(cursor, country=None, exclude_ids=None,
+                           shard_index=None, shard_count=None):
     """
     `exclude_ids` is the run's set of raw records that already failed to
     promote. It is REQUIRED to avoid an infinite loop: the claim holds only a
@@ -94,6 +95,14 @@ def _claim_one_raw_record(cursor, country=None, exclude_ids=None):
     crawler repo). So a failed promotion rolls back, releases the lock, leaves
     the row still unpromoted, and would be claimed again immediately — forever.
     Excluding known failures is what makes the loop terminate.
+
+    `shard_index`/`shard_count` partition the queue by `id % shard_count`, so
+    each worker only ever looks at its own disjoint slice. SKIP LOCKED alone is
+    not enough here: the row lock is dropped the moment the INSERT commits, but
+    the LEFT JOIN only starts excluding the row once that commit is visible, so
+    concurrent workers repeatedly landed on the same lowest-id row and burned an
+    attempt discovering it was already promoted. Sharding removes the contention
+    by construction rather than relying on that timing.
     """
     query = """
         SELECT r.id, r.name, r.country_id, r.document_url, r.json_data
@@ -106,6 +115,9 @@ def _claim_one_raw_record(cursor, country=None, exclude_ids=None):
     if country:
         query += " AND c.name = %s"
         params.append(country)
+    if shard_count and shard_count > 1:
+        query += " AND (r.id %% %s) = %s"
+        params.extend([shard_count, shard_index])
     if exclude_ids:
         query += " AND r.id <> ALL(%s)"
         params.append(list(exclude_ids))
@@ -157,7 +169,8 @@ def _promote_one(cursor, raw_record):
     return cursor.fetchone()
 
 
-def _worker(country, remaining, remaining_lock, failed_ids, failed_lock):
+def _worker(shard_index, shard_count, country, remaining, remaining_lock,
+            failed_ids, failed_lock):
     """
     One worker's claim loop: keeps claiming and promoting raw records until
     none are left (or `remaining` runs out). Each claim+promote is one short
@@ -179,7 +192,10 @@ def _worker(country, remaining, remaining_lock, failed_ids, failed_lock):
             with failed_lock:
                 skip_ids = set(failed_ids)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                raw_record = _claim_one_raw_record(cur, country=country, exclude_ids=skip_ids)
+                raw_record = _claim_one_raw_record(
+                    cur, country=country, exclude_ids=skip_ids,
+                    shard_index=shard_index, shard_count=shard_count,
+                )
                 if not raw_record:
                     conn.commit()
                     break
@@ -237,7 +253,8 @@ def promote_pending(limit=None, country=None, workers=1):
     failed_ids = set()
     failed_lock = threading.Lock()
     totals = run_worker_pool(
-        lambda: _worker(country, remaining, remaining_lock, failed_ids, failed_lock),
+        lambda i, n: _worker(i, n, country, remaining, remaining_lock,
+                              failed_ids, failed_lock),
         workers,
         label="promote",
     )

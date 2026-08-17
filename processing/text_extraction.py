@@ -188,7 +188,11 @@ def extract_pending(limit=None, country=None, workers=1):
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
     totals = run_worker_pool(
-        lambda: _worker(country, remaining, remaining_lock), workers, label="text_extraction"
+        # No sharding needed: claim_text_extraction flips a PERSISTED status to
+        # PROCESSING, so a claimed row is invisible to other workers regardless
+        # of commit timing (unlike Stage A — see promote._claim_one_raw_record).
+        lambda _i, _n: _worker(country, remaining, remaining_lock),
+        workers, label="text_extraction"
     )
     logger.info(f"[text_extraction] done: {totals}")
     return totals

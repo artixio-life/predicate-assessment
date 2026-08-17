@@ -468,7 +468,9 @@ def extract_pending(limit=None, country=None, workers=1):
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
     totals = run_worker_pool(
-        lambda: _worker(country, remaining, remaining_lock), workers, label="ai_extraction"
+        # No sharding needed — see the note in text_extraction.extract_pending.
+        lambda _i, _n: _worker(country, remaining, remaining_lock),
+        workers, label="ai_extraction"
     )
     logger.info(f"[ai_extraction] done: {totals}")
     return totals

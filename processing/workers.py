@@ -13,9 +13,15 @@ logger = logging.getLogger(__name__)
 
 
 def run_worker_pool(worker_fn, num_workers, label):
+    """
+    `worker_fn` is called as worker_fn(worker_index, num_workers) so a stage
+    can shard its own work deterministically (see promote.py) instead of
+    relying on lock timing to keep workers off each other's rows.
+    """
     totals = {}
-    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as pool:
-        futures = [pool.submit(worker_fn) for _ in range(max(1, num_workers))]
+    count = max(1, num_workers)
+    with ThreadPoolExecutor(max_workers=count) as pool:
+        futures = [pool.submit(worker_fn, i, count) for i in range(count)]
         for future in as_completed(futures):
             try:
                 result = future.result() or {}
