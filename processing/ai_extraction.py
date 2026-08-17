@@ -166,7 +166,7 @@ strength: "225 mg"],
   "product_data": {
     "_schema_version": "1",
     "substance": {"inn": "for a COMBINATION product with multiple active ingredients, join them with ' + ', e.g. 'Amoxicillin + Clavulanic acid' — the full per-ingredient strength/salt breakdown goes in presentations[].active_ingredients below, not here"|null, "salt_form": "null for combination products (salt is per-ingredient, see presentations[].active_ingredients[].salt)"|null, "modality": "small_molecule|biologic|adc|vaccine|peptide"|null, "target": str|null, "moa": str|null},
-    "presentations": [{"per_value": "CONCENTRATION DENOMINATOR ONLY, for liquids/injectables where strength is stated per volume — '4 mg/2 mL' -> per_value=2, per_unit='mL'. NEVER a pack size or tablet count: a box of 20 tablets is NOT per_value=20, it is per_value=null (pack sizes are not stored in this schema at all)"|number|null, "per_unit": "e.g. 'mL' — null for solid oral forms"|null, "form": str|null, "route": str|null, "active_ingredients": [{"substance": "English, base form not salt", "strength_value": number|null, "strength_unit": str|null, "salt": {"substance": str, "value": number, "unit": str}|null}]}],
+    "presentations": [{"per_value": "CONCENTRATION DENOMINATOR ONLY, for liquids/injectables where strength is stated per volume — '4 mg/2 mL' -> per_value=2, per_unit='mL'. NEVER a pack size or tablet count: a box of 20 tablets is NOT per_value=20, it is per_value=null (pack sizes are not stored in this schema at all)"|number|null, "per_unit": "e.g. 'mL' — null for solid oral forms"|null, "pack_size": "how many units the pack contains, e.g. 10 for a box of 10 tablets, 1 for a single ampoule. One presentation entry per distinct pack size"|number|null, "pack_unit": "what pack_size counts, e.g. 'tablets', 'capsules', 'ampoules', 'vials'"|str|null, "form": str|null, "route": str|null, "active_ingredients": [{"substance": "English, base form not salt", "strength_value": number|null, "strength_unit": str|null, "salt": {"substance": str, "value": number, "unit": str}|null}]}],
     "indications": [{"condition": str, "population": str|null, "line_of_therapy": str|null, "biomarker": str|null, "approval_date": "YYYY-MM-DD"|null}],
     "approval": {"pathway": "innovator|generic|biosimilar|hybrid|similar"|null, "registration_class": "same value as columns.product_type, in English"|null, "conditional": bool|null, "priority_review": bool|null, "reference_product": str|null},
     "pivotal_evidence": [{"study_id": str|null, "design": str, "n": number|null, "endpoint": str, "value": number|null, "unit": str|null, "comparator": str|null, "outcome": "met|not_met"|null}],
@@ -224,19 +224,23 @@ every entry already present and append genuinely new, distinct entries found in 
 excerpt. For excipients specifically, only the active substance(s) belong in \
 active_ingredients/substance — everything else in the formulation (fillers, coatings, \
 preservatives, solvents) goes in excipients instead.
-- A product_data.presentations ENTRY is identified by (strength set + form + route) \
-and NOTHING ELSE. Deduplicate ruthlessly against that key:
+- A product_data.presentations ENTRY is identified by (strength set + form + route + \
+pack_size) and NOTHING ELSE. Deduplicate ruthlessly against that key:
   * More than one active ingredient is still ONE entry. A combination tablet with \
 amoxicillin 500 mg + clavulanic acid 125 mg is ONE presentation entry with \
 active_ingredients = [{"substance":"Amoxicillin","strength_value":500,...}, \
 {"substance":"Clavulanic acid","strength_value":125,...}], NOT two entries.
-  * PACKAGING VARIANTS ARE NOT SEPARATE PRESENTATIONS. Pack size, blister/container \
-material, carton type, hospital-vs-retail packs, and per-presentation registry codes are \
-NOT part of the identity and are not stored in this schema anywhere. A registry listing \
-six rows — "750 mg tablet, clear blister, x20", "750 mg tablet, clear blister, x200", \
-"750 mg tablet, opaque blister, x20", "750 mg tablet, alu/alu blister, x20", etc. — is \
-ONE presentation entry (750 mg, film-coated tablet, oral), not six. Emitting the same \
-strength+form+route twice is always an error.
+  * PACK SIZE IS part of the identity: one entry per distinct pack size. Montelukast \
+4 mg chewable tablet in 10s, 30s and 100s plus 5 mg in 10s, 30s and 100s is SIX entries \
+(pack_size 10/30/100 for each of the two strengths). Put the quantity in pack_size — \
+never in per_value, which means something entirely different.
+  * CONTAINER MATERIAL IS NOT part of the identity. Blister material, carton type, \
+hospital-vs-retail labelling and per-presentation registry codes are not stored anywhere \
+in this schema, so they never create a new entry. A registry listing "750 mg tablet, \
+clear blister, x20", "750 mg tablet, opaque blister, x20" and "750 mg tablet, alu/alu \
+blister, x20" is ONE entry (750 mg, film-coated tablet, oral, pack_size 20) — the three \
+rows differ only in a field this schema does not keep. Emitting the same \
+strength+form+route+pack_size twice is always an error.
   * Genuinely different strengths ARE separate entries (4 mg/2 mL and 8 mg/4 mL of the \
 same injectable are two).
 - product_data.key_risks does NOT accumulate the same way — it is a curated shortlist, \
