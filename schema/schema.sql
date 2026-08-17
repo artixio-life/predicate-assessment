@@ -37,13 +37,22 @@ CREATE TABLE IF NOT EXISTS drug.products (
     raw_record_id             INTEGER REFERENCES source.drug_predicate_raw_records(id) ON DELETE SET NULL,
 
     -- naming ----------------------------------------------------------------
-    -- product_name: full name as printed, incl. strength and form.
-    --               'Pregabalin Wockhardt 225 mg Hard Capsules'
+    -- product_name: full name as printed, incl. strength and form, in the
+    --               source language. Written ONLY by Stage A, verbatim from
+    --               the crawler's raw record — the AI never overwrites it, so
+    --               it stays the as-crawled provenance value.
+    --               'Pregabalin Wockhardt 225 mg Hard Capsules', '桃核承气汤颗粒'
+    -- product_name_en: the same full name in English (translated, or
+    --               transliterated where no translation exists), written by
+    --               Stage C. NULL when product_name is already English — so
+    --               read it as COALESCE(product_name_en, product_name).
+    --               '桃核承气汤颗粒' -> 'Taohe Chengqi Decoction Granules'
     -- brand_name:   trade-name portion, English/translated. 'Pregabalin Wockhardt'
     -- brand_name_local: same in original script, for CN/BR/etc. '普瑞巴林胶囊'
     --               Never overwrite this with a translation — it is the only
     --               way to re-derive a bad translation without re-crawling.
     product_name              TEXT,
+    product_name_en           TEXT,
     brand_name                TEXT,
     brand_name_local          TEXT,
     generic_name              TEXT,
@@ -165,6 +174,10 @@ ALTER TABLE drug.products ADD CONSTRAINT chk_text_extraction_status CHECK (text_
 ALTER TABLE drug.products DROP CONSTRAINT IF EXISTS chk_ai_extraction_status;
 ALTER TABLE drug.products ADD CONSTRAINT chk_ai_extraction_status CHECK (ai_extraction_status IN
     ('PENDING','PROCESSING','DONE','NEEDS_REVIEW','SKIPPED','FAILED'));
+
+-- product_name_en: added after the first rows were already extracted. Purely
+-- additive — product_name keeps its as-crawled value untouched.
+ALTER TABLE drug.products ADD COLUMN IF NOT EXISTS product_name_en TEXT;
 
 -- raw_record_id already has an index via its UNIQUE constraint above.
 CREATE INDEX IF NOT EXISTS idx_products_country     ON drug.products(country_id);

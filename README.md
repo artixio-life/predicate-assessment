@@ -42,20 +42,31 @@ The coarse `processing_status` summarizes both:
 
 ## Setup
 
+**1. Apply the schema once, by hand.** `main.py` deliberately does NOT do this
+— run `schema/schema.sql` against the target database yourself (every
+statement in it is idempotent, so re-running is safe):
+
+```bash
+psql "$DATABASE_URL" -f schema/schema.sql
+```
+
+It expects the `drug` schema (regulatory-explorer) and
+`source.drug_predicate_raw_records` (source-predicate) to already exist, and
+checks for both up front, raising a clear error naming whichever is missing
+rather than failing on an opaque FK error. If you'd rather apply it from
+Python, `db.init_db()` does the same thing.
+
+**2. Run the pipeline.**
+
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in the same DB/MinIO creds as source-predicate,
                         # plus MISTRAL_API_KEY and OPEN_ROUTER_API_KEY
-python main.py
+python main.py         # or: docker compose up
 ```
 
-`main.py` applies `schema/schema.sql` (idempotent) and then runs all three
-stages once. It expects the `drug` schema (regulatory-explorer) and
-`source.drug_predicate_raw_records` (source-predicate) to already exist on
-the target database — `schema/schema.sql` checks for both and raises a clear
-error naming whichever is missing.
-
-Set `PIPELINE_LIMIT` to cap how many rows each stage processes in one run.
+`PIPELINE_LIMIT` caps rows per stage, `PIPELINE_COUNTRY` scopes to one
+country, `PIPELINE_WORKERS` sets concurrency (default 4).
 
 ## Out of scope (for now)
 

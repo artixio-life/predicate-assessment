@@ -71,7 +71,7 @@ PRODUCT_DATA_KEYS = (
 # (COALESCE, see module docstring) — it's here so the LLM still reports it
 # when found, but the UPDATE below decides whether it's actually applied.
 COLUMN_SCALAR_FIELDS = (
-    "brand_name", "brand_name_local", "generic_name",
+    "product_name_en", "brand_name", "brand_name_local", "generic_name",
     "mah_name", "mah_address", "manufacturer", "manufacturer_address",
     "registration_number", "product_type", "status",
     "registration_date", "approval_date", "market_authorization_date",
@@ -96,7 +96,15 @@ Output JSON must have exactly two top-level keys, "columns" and "product_data":
 
 {
   "columns": {
-    "brand_name": str|null, "brand_name_local": str|null,
+    "product_name_en": "the product's FULL name (including strength and dosage form, as \
+printed) rendered in English — translate it, or transliterate where no translation \
+exists: '桃核承气汤颗粒' -> 'Taohe Chengqi Decoction Granules', 'ANSENTRON Solução \
+Injetável 4 mg/2 mL' -> 'ANSENTRON Solution for Injection 4 mg/2 mL'. Set to null ONLY \
+if the source name is already entirely English — never echo an unchanged non-English \
+name here"|null,
+    "brand_name": str|null,
+    "brand_name_local": "the trade name in its ORIGINAL script — null when the source is \
+already Latin script and would just duplicate brand_name"|null,
     "generic_name": "the INN/base substance name — same base form as active_ingredients \
 below, e.g. 'Ondansetron', NOT the salt form 'Ondansetron hydrochloride dihydrate' (the \
 salt belongs in product_data.substance.salt_form instead)"|null,

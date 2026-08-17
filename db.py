@@ -34,18 +34,21 @@ def dict_cursor(conn):
 
 def init_db():
     """
-    Apply schema/schema.sql. Safe to run on every startup — every statement
-    is idempotent. Requires that the source-predicate and regulatory-explorer
-    schemas already exist on this database (schema.sql checks and raises a
-    clear error naming which one is missing, rather than failing on a raw FK
-    error).
+    Apply schema/schema.sql. NOT called at startup — main.py leaves schema
+    changes to be applied by hand. This exists for when you'd rather apply it
+    from Python (`python -c 'import db; db.init_db()'`).
+
+    Safe to re-run: every statement in schema.sql is idempotent. Requires that
+    the source-predicate and regulatory-explorer schemas already exist on this
+    database (schema.sql checks and raises a clear error naming which one is
+    missing, rather than failing on a raw FK error).
     """
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             schema_path = os.path.join(os.path.dirname(__file__), 'schema', 'schema.sql')
             with open(schema_path, 'r') as f:
-                logger.info("Applying schema...")
+                logger.info(f"Applying {schema_path}...")
                 cur.execute(f.read())
                 conn.commit()
     except Exception as e:
