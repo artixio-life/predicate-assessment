@@ -18,6 +18,7 @@ INSERT actually lands.
 import logging
 import threading
 
+from psycopg2.errors import UniqueViolation
 from psycopg2.extras import Json, RealDictCursor
 
 from db import get_db_connection
@@ -39,19 +40,61 @@ _TOP_LEVEL_KEYS = (
 )
 
 
+def _looks_like_identifier(value):
+    """
+    Reject values that are prose rather than a registration identifier.
+
+    Some sources put a category or status string in the same field a
+    registration number would occupy (observed: 'Old Medicine'). Storing that
+    is worse than storing nothing: it is not an identifier, and because many
+    products share the same phrase they all collide on the
+    (country_id, registration_number) unique constraint, so every one after
+    the first fails to promote.
+
+    Every real registration number we handle contains at least one digit —
+    '126750089', '1.0573.0562', 'PL 29831/0647', 'A99/999', 'Z20050001' — so
+    requiring a digit is enough to separate them from prose, without needing a
+    per-country format rule.
+    """
+    text = str(value).strip()
+    if not text:
+        return False
+    return any(ch.isdigit() for ch in text)
+
+
 def guess_registration_number(json_data):
     if not json_data:
         return None
+    candidates = []
     detail = json_data.get('detail') if isinstance(json_data.get('detail'), dict) else {}
     if detail.get('registration_number'):
-        return str(detail['registration_number'])
+        candidates.append(detail['registration_number'])
     for key in _TOP_LEVEL_KEYS:
         if json_data.get(key):
-            return str(json_data[key])
+            candidates.append(json_data[key])
+
+    for candidate in candidates:
+        if _looks_like_identifier(candidate):
+            return str(candidate).strip()
+
+    if candidates:
+        logger.warning(
+            f"[promote] ignoring non-identifier registration number "
+            f"{candidates[0]!r} — storing NULL instead"
+        )
     return None
 
 
-def _claim_one_raw_record(cursor, country=None):
+def _claim_one_raw_record(cursor, country=None, exclude_ids=None):
+    """
+    `exclude_ids` is the run's set of raw records that already failed to
+    promote. It is REQUIRED to avoid an infinite loop: the claim holds only a
+    transaction-scoped row lock (FOR UPDATE), and source.drug_predicate_raw_records
+    has no status column of its own to record an attempt (it belongs to the
+    crawler repo). So a failed promotion rolls back, releases the lock, leaves
+    the row still unpromoted, and would be claimed again immediately — forever.
+    Excluding known failures is what makes the loop terminate.
+    """
     query = """
         SELECT r.id, r.name, r.country_id, r.document_url, r.json_data
         FROM source.drug_predicate_raw_records r
@@ -63,6 +106,9 @@ def _claim_one_raw_record(cursor, country=None):
     if country:
         query += " AND c.name = %s"
         params.append(country)
+    if exclude_ids:
+        query += " AND r.id <> ALL(%s)"
+        params.append(list(exclude_ids))
     query += " ORDER BY r.id FOR UPDATE OF r SKIP LOCKED LIMIT 1"
     cursor.execute(query, tuple(params))
     return cursor.fetchone()
@@ -111,25 +157,29 @@ def _promote_one(cursor, raw_record):
     return cursor.fetchone()
 
 
-def _worker(country, remaining, remaining_lock):
+def _worker(country, remaining, remaining_lock, failed_ids, failed_lock):
     """
     One worker's claim loop: keeps claiming and promoting raw records until
     none are left (or `remaining` runs out). Each claim+promote is one short
     transaction — promotion is a single fast INSERT, no slow external calls,
-    so there's no need for retry-across-an-open-transaction here: on any
-    failure this worker just rolls back (releasing the row lock so it's
-    immediately claimable again, by this worker or another) and moves on.
+    so there is no retry-across-an-open-transaction here.
+
+    A failed row is added to `failed_ids` (shared by every worker in the run)
+    and excluded from subsequent claims. Without that the loop never
+    terminates — see _claim_one_raw_record's docstring.
     """
     conn = get_db_connection()
-    stats = {"promoted": 0, "failed": 0}
+    stats = {"promoted": 0, "duplicate": 0, "failed": 0}
     try:
         while True:
             if remaining is not None:
                 with remaining_lock:
                     if remaining[0] <= 0:
                         break
+            with failed_lock:
+                skip_ids = set(failed_ids)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                raw_record = _claim_one_raw_record(cur, country=country)
+                raw_record = _claim_one_raw_record(cur, country=country, exclude_ids=skip_ids)
                 if not raw_record:
                     conn.commit()
                     break
@@ -141,10 +191,27 @@ def _worker(country, remaining, remaining_lock):
                         logger.info(f"[promote] raw_record={raw_record['id']} -> product={result['id']}")
                     else:
                         logger.info(f"[promote] raw_record={raw_record['id']} already promoted (race), skipping")
+                except UniqueViolation:
+                    # A sibling raw record describing the SAME product was already
+                    # promoted — crawlers can emit the same product twice (observed
+                    # for SAHPRA, where application_no is duplicated despite being
+                    # its dedup key). One drug.products row per real product is the
+                    # wanted outcome, so this is a routine skip, not a failure.
+                    conn.rollback()
+                    stats["duplicate"] += 1
+                    with failed_lock:
+                        failed_ids.add(raw_record['id'])
+                    logger.info(
+                        f"[promote] raw_record={raw_record['id']} skipped: another raw record "
+                        f"already produced the product for registration_number="
+                        f"{guess_registration_number(raw_record['json_data'])!r}"
+                    )
                 except Exception as e:
                     conn.rollback()
                     stats["failed"] += 1
-                    logger.error(f"[promote] raw_record={raw_record['id']} failed: {e}")
+                    with failed_lock:
+                        failed_ids.add(raw_record['id'])
+                    logger.error(f"[promote] raw_record={raw_record['id']} failed (will not be retried this run): {e}")
             if remaining is not None:
                 with remaining_lock:
                     remaining[0] -= 1
@@ -165,8 +232,23 @@ def promote_pending(limit=None, country=None, workers=1):
     """
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
+    # Shared across workers so one worker's known-bad row is not picked up and
+    # re-failed by another. Per-run only — a fixed row is retried next run.
+    failed_ids = set()
+    failed_lock = threading.Lock()
     totals = run_worker_pool(
-        lambda: _worker(country, remaining, remaining_lock), workers, label="promote"
+        lambda: _worker(country, remaining, remaining_lock, failed_ids, failed_lock),
+        workers,
+        label="promote",
     )
+    # Only genuine failures are worth a warning; `duplicate` is expected whenever
+    # a crawler emitted the same product more than once.
+    if totals.get("failed"):
+        logger.warning(f"[promote] {totals['failed']} raw record(s) failed — see errors above")
+    if totals.get("duplicate"):
+        logger.info(
+            f"[promote] {totals['duplicate']} raw record(s) skipped as duplicates of an "
+            f"already-promoted product"
+        )
     logger.info(f"[promote] done: {totals}")
     return totals
