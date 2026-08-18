@@ -143,7 +143,11 @@ unless the document says so directly."|null,
     "registration_date": "YYYY-MM-DD — when the product/entry was first registered or \
 listed with the regulator. Regulators label this differently; map ANY of these to this \
 field: 'ARTG Start Date' or 'Start Date' (Australia TGA), 'Date Registered' (South \
-Africa SAHPRA), or an equivalent 'registered on'/'listed since' date under any other \
+Africa SAHPRA), 'DATE OF FIRST AUTHORISATION/RENEWAL OF THE AUTHORISATION' (UK MHRA/EU \
+SmPC section 9 — use the FIRST authorisation date, not a later renewal date, when both \
+appear on that line), 'Original Approval Date' or 'Effective Date of Issue' (used by \
+some regulators as the product's founding/registration event rather than a distinct \
+approval step), or an equivalent 'registered on'/'listed since' date under any other \
 label. Fill it whenever ONE of these is explicitly stated — do not infer from a label \
 revision, publication, or document-generation date/timestamp (e.g. a PDF footer's \
 'Produced at' date is NEVER this field, and is not the same event as registration)"|null,
