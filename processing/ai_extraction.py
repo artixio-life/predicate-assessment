@@ -269,6 +269,14 @@ rows differ only in a field this schema does not keep. Emitting the same \
 strength+form+route+pack_size twice is always an error.
   * Genuinely different strengths ARE separate entries (4 mg/2 mL and 8 mg/4 mL of the \
 same injectable are two).
+  * NULL pack_size is not a distinct value from a populated one — it means "pack size not \
+yet known," not "no pack." If an entry already in the JSON has the same strength set + \
+form + route with pack_size null, and this excerpt (or an earlier one) gives a pack_size/\
+pack_unit for that same presentation, fill it into the existing entry instead of adding a \
+new one. Only keep them as two separate entries if there is a real distinguishing \
+difference beyond the null vs. populated pack_size (e.g. the populated one is actually a \
+different quantity than another already-known non-null pack_size for that same strength \
+set + form + route).
 - product_data.key_risks does NOT accumulate the same way — it is a curated shortlist, \
 not an adverse-reaction dump (columns.adverse_reactions is where the full list goes). \
 Every time, re-rank across this excerpt PLUS everything already listed, and keep only \
