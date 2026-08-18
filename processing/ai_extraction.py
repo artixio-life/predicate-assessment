@@ -42,6 +42,7 @@ import logging
 import os
 import threading
 
+import psycopg2.errors
 from openai import OpenAI
 from psycopg2.extras import Json, RealDictCursor
 
@@ -435,7 +436,13 @@ def _input_units(cursor, product):
     return _json_data_units(product) + document_chunks
 
 
-def _persist(cursor, product_id, accumulated, ai_status, attempts, error_summary, processing_status):
+def _persist(cursor, product_id, accumulated, ai_status, attempts, error_summary,
+             processing_status, write_registration_number=True):
+    """
+    `write_registration_number=False` persists everything except the
+    AI-supplied registration number — the fallback when writing it would
+    violate uq_products_country_regnum (see _persist_with_regnum_fallback).
+    """
     columns = accumulated.get("columns") or {}
     product_data = accumulated.get("product_data") or {}
 
@@ -452,8 +459,24 @@ def _persist(cursor, product_id, accumulated, ai_status, attempts, error_summary
     for field in COLUMN_SCALAR_FIELDS:
         if field == "registration_number":
             # Never override Stage A's value (from crawler json_data) — only
-            # fill it in if Stage A left it null.
-            set_clauses.append("registration_number = COALESCE(products.registration_number, %(registration_number)s)")
+            # fill it in if Stage A left it null, and only if no other product
+            # in the same country already claims that number. Sources where
+            # Stage A captures no registration number (MHRA) otherwise let the
+            # LLM's value collide on uq_products_country_regnum.
+            if write_registration_number:
+                set_clauses.append("""
+                    registration_number = COALESCE(
+                        products.registration_number,
+                        CASE WHEN %(registration_number)s IS NOT NULL AND NOT EXISTS (
+                            SELECT 1 FROM drug.products other
+                            WHERE other.country_id IS NOT DISTINCT FROM products.country_id
+                              AND other.registration_number = %(registration_number)s
+                              AND other.id <> products.id
+                        ) THEN %(registration_number)s END
+                    )
+                """)
+            else:
+                set_clauses.append("registration_number = products.registration_number")
         else:
             set_clauses.append(f"{field} = %({field})s")
         params[field] = columns.get(field)
@@ -476,6 +499,31 @@ def _persist(cursor, product_id, accumulated, ai_status, attempts, error_summary
         """,
         params,
     )
+
+
+def _persist_with_regnum_fallback(cursor, product_id, accumulated, ai_status, attempts,
+                                  error_summary, processing_status):
+    """
+    _persist's NOT EXISTS guard closes the common case, but two workers can
+    still persist the same brand-new registration number at the same instant
+    (each one's guard passes before the other commits). A SAVEPOINT lets us
+    absorb that unique violation and re-persist without the number, instead of
+    letting it abort the transaction and kill the worker thread — the LLM's
+    other extracted fields are still worth keeping.
+    """
+    cursor.execute("SAVEPOINT persist_product")
+    try:
+        _persist(cursor, product_id, accumulated, ai_status, attempts,
+                 error_summary, processing_status)
+    except psycopg2.errors.UniqueViolation:
+        cursor.execute("ROLLBACK TO SAVEPOINT persist_product")
+        logger.warning(
+            f"[ai_extraction] product={product_id}: AI registration_number collides with an "
+            f"existing product in the same country — persisting everything else without it"
+        )
+        _persist(cursor, product_id, accumulated, ai_status, attempts,
+                 error_summary, processing_status, write_registration_number=False)
+    cursor.execute("RELEASE SAVEPOINT persist_product")
 
 
 def _extract_one(cursor, product):
@@ -526,8 +574,27 @@ def _extract_one(cursor, product):
 
     error_summary = "; ".join(f"excerpts {p}: {err}" for p, err in failed_chunks)[:2000] or None
 
-    _persist(cursor, product["id"], accumulated, ai_status, attempts, error_summary, processing_status)
+    _persist_with_regnum_fallback(
+        cursor, product["id"], accumulated, ai_status, attempts, error_summary, processing_status
+    )
     return ai_status
+
+
+def _mark_failed(cursor, product_id, error):
+    """Terminal status for a row whose extraction raised something unexpected,
+    so the next run doesn't re-claim it and hit the same wall."""
+    cursor.execute(
+        """
+        UPDATE drug.products
+        SET ai_extraction_status = 'FAILED',
+            ai_extraction_attempts = ai_extraction_attempts + 1,
+            ai_extraction_error = %s,
+            processing_status = 'FAILED',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (str(error)[:2000], product_id),
+    )
 
 
 def _worker(country, remaining, remaining_lock, progress):
@@ -553,11 +620,27 @@ def _worker(country, remaining, remaining_lock, progress):
                 with remaining_lock:
                     remaining[0] -= 1
 
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                outcome = _extract_one(cur, product)
-                conn.commit()
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    outcome = _extract_one(cur, product)
+                    conn.commit()
+                logger.info(f"[ai_extraction] product={product['id']} -> {outcome}")
+            except Exception as e:
+                # One unexpected row must not take the whole worker down: before
+                # this, any escaping exception ended the thread and the pool
+                # silently shrank until nothing was processing. Mark the row
+                # FAILED so it is not re-claimed forever, and carry on.
+                conn.rollback()
+                outcome = "FAILED"
+                logger.exception(f"[ai_extraction] product={product['id']} errored — marking FAILED")
+                try:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        _mark_failed(cur, product["id"], e)
+                        conn.commit()
+                except Exception:
+                    conn.rollback()
+                    logger.exception(f"[ai_extraction] product={product['id']}: could not record failure")
             stats[outcome] = stats.get(outcome, 0) + 1
-            logger.info(f"[ai_extraction] product={product['id']} -> {outcome}")
             progress.advance()
     finally:
         conn.close()
