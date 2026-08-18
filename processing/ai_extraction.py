@@ -58,13 +58,13 @@ logger = logging.getLogger(__name__)
 
 EXTRACTOR_MODEL = os.getenv("EXTRACTOR_MODEL", "google/gemini-2.5-flash")
 
-# Chunks are ~1800 tokens each (processing/chunking.py) — 5 per call is a
+# Chunks are ~1800 tokens each (processing/chunking.py) — 7 per call is a
 # few thousand tokens, nowhere near strain on a 1M-token context window, and
-# cuts a 10-chunk document from 10 sequential LLM calls down to 2. The fold
+# cuts a 14-chunk document from 14 sequential LLM calls down to 2. The fold
 # still carries the accumulated JSON forward between batches, so accuracy
 # (each call seeing the running result-so-far) is unaffected — this only
 # reduces round-trips.
-CHUNKS_PER_CALL = int(os.getenv("AI_EXTRACTION_CHUNKS_PER_CALL", "5"))
+CHUNKS_PER_CALL = int(os.getenv("AI_EXTRACTION_CHUNKS_PER_CALL", "7"))
 
 
 def _batch(items, size):
