@@ -45,6 +45,54 @@ def claim_text_extraction(cursor, country=None):
     return cursor.fetchone()
 
 
+def count_text_extraction_pending(cursor, country=None):
+    """
+    How many rows claim_text_extraction() would eventually hand out — same
+    predicate as the claim, run once up front so the stage can report an ETA.
+    It is a snapshot: a concurrent crawler adding rows mid-run makes the ETA
+    optimistic, which is why progress lines are advisory, not a contract.
+    """
+    params = []
+    country_clause = ""
+    if country:
+        country_clause = " AND g.country_name = %s"
+        params.append(country)
+    cursor.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM drug.products p
+        LEFT JOIN drug.regulatory_geography g ON g.id = p.country_id
+        WHERE (p.text_extraction_status = 'PENDING'
+               OR (p.text_extraction_status = 'PROCESSING'
+                   AND p.updated_at < CURRENT_TIMESTAMP - INTERVAL '{STALE_MINUTES} minutes')){country_clause}
+        """,
+        tuple(params),
+    )
+    return cursor.fetchone()["n"]
+
+
+def count_ai_extraction_pending(cursor, country=None):
+    """See count_text_extraction_pending — same idea for Stage C."""
+    params = []
+    country_clause = ""
+    if country:
+        country_clause = " AND g.country_name = %s"
+        params.append(country)
+    cursor.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM drug.products p
+        LEFT JOIN drug.regulatory_geography g ON g.id = p.country_id
+        WHERE p.processing_status = 'PARSED'
+          AND (p.ai_extraction_status = 'PENDING'
+               OR (p.ai_extraction_status = 'PROCESSING'
+                   AND p.updated_at < CURRENT_TIMESTAMP - INTERVAL '{STALE_MINUTES} minutes')){country_clause}
+        """,
+        tuple(params),
+    )
+    return cursor.fetchone()["n"]
+
+
 def claim_ai_extraction(cursor, country=None):
     params = []
     country_clause = ""

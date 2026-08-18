@@ -22,6 +22,7 @@ import threading
 from psycopg2.extras import Json, RealDictCursor, execute_values
 
 from db import get_db_connection
+from processing.progress import Progress
 from processing.workers import run_worker_pool
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,29 @@ def _claim_raw_records(cursor, country=None, exclude_ids=None,
     return cursor.fetchall()
 
 
+def count_pending_raw_records(cursor, country=None):
+    """
+    How many raw records are still unpromoted — the same predicate
+    _claim_raw_records() uses, minus the sharding/watermark bookkeeping, run
+    once up front so the stage can report progress and an ETA. Counts every
+    candidate, including ones that will turn out to be duplicates and get
+    skipped, so this is an upper bound on the work.
+    """
+    query = """
+        SELECT COUNT(*) AS n
+        FROM source.drug_predicate_raw_records r
+        LEFT JOIN drug.products p ON p.raw_record_id = r.id
+        LEFT JOIN source.country c ON c.id = r.country_id
+        WHERE p.id IS NULL
+    """
+    params = []
+    if country:
+        query += " AND c.name = %s"
+        params.append(country)
+    cursor.execute(query, tuple(params))
+    return cursor.fetchone()["n"]
+
+
 def load_geography_cache(cursor):
     """
     Resolve EVERY source.country -> (drug.regulatory_geography.id, agency_acronym)
@@ -240,7 +264,7 @@ def _promote_batch(cursor, raw_records, geo_cache):
 
 
 def _worker(shard_index, shard_count, country, remaining, remaining_lock,
-            failed_ids, failed_lock):
+            failed_ids, failed_lock, progress):
     """
     One worker's claim loop, working a BATCH at a time: claim up to
     BATCH_SIZE rows from this worker's shard, insert them in one statement,
@@ -310,6 +334,7 @@ def _worker(shard_index, shard_count, country, remaining, remaining_lock,
             # Advance past everything just handled, whether promoted, skipped
             # as a duplicate, or failed — none of it is claimable again.
             watermark = max(r['id'] for r in raw_records)
+            progress.advance(len(raw_records))
             if remaining is not None:
                 with remaining_lock:
                     remaining[0] -= len(raw_records)
@@ -334,12 +359,24 @@ def promote_pending(limit=None, country=None, workers=1):
     # re-failed by another. Per-run only — a fixed row is retried next run.
     failed_ids = set()
     failed_lock = threading.Lock()
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            pending = count_pending_raw_records(cur, country=country)
+        conn.commit()
+    finally:
+        conn.close()
+    total = min(pending, limit) if limit else pending
+    progress = Progress("promote", total=total, workers=workers)
+
     totals = run_worker_pool(
         lambda i, n: _worker(i, n, country, remaining, remaining_lock,
-                              failed_ids, failed_lock),
+                              failed_ids, failed_lock, progress),
         workers,
         label="promote",
     )
+    progress.finish()
     # Only genuine failures are worth a warning; `duplicate` is expected whenever
     # a crawler emitted the same product more than once.
     if totals.get("failed"):

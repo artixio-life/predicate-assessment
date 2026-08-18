@@ -20,7 +20,8 @@ import storage
 from db import get_db_connection
 from processing import mistral_ocr
 from processing.chunking import chunk_text
-from processing.claim import claim_text_extraction
+from processing.claim import claim_text_extraction, count_text_extraction_pending
+from processing.progress import Progress
 from processing.retry import run_with_retries, RetriesExhausted
 from processing.workers import run_worker_pool
 
@@ -124,7 +125,7 @@ def _mark_failed(cursor, product, attempts, error):
     )
 
 
-def _worker(country, remaining, remaining_lock):
+def _worker(country, remaining, remaining_lock, progress):
     """
     One worker's claim loop. claim_text_extraction() atomically flips a row
     to PROCESSING before this worker ever starts the slow download/OCR work,
@@ -152,6 +153,7 @@ def _worker(country, remaining, remaining_lock):
                     _skip_no_source_url(cur, product)
                     conn.commit()
                 stats["skipped"] += 1
+                progress.advance()
                 continue
 
             try:
@@ -171,6 +173,7 @@ def _worker(country, remaining, remaining_lock):
                     _mark_failed(cur, product, e.attempts, e.last_exception)
                     conn.commit()
                 logger.error(f"[text_extraction] product={product['id']} failed after {e.attempts} attempts: {e.last_exception}")
+            progress.advance()
     finally:
         conn.close()
     return stats
@@ -187,12 +190,24 @@ def extract_pending(limit=None, country=None, workers=1):
     """
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            pending = count_text_extraction_pending(cur, country=country)
+        conn.commit()
+    finally:
+        conn.close()
+    total = min(pending, limit) if limit else pending
+    progress = Progress("text_extraction", total=total, workers=workers)
+
     totals = run_worker_pool(
         # No sharding needed: claim_text_extraction flips a PERSISTED status to
         # PROCESSING, so a claimed row is invisible to other workers regardless
         # of commit timing (unlike Stage A — see promote._claim_one_raw_record).
-        lambda _i, _n: _worker(country, remaining, remaining_lock),
+        lambda _i, _n: _worker(country, remaining, remaining_lock, progress),
         workers, label="text_extraction"
     )
+    progress.finish()
     logger.info(f"[text_extraction] done: {totals}")
     return totals

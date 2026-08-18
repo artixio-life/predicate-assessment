@@ -47,8 +47,9 @@ from psycopg2.extras import Json, RealDictCursor
 
 from db import get_db_connection
 from processing.chunking import DEFAULT_TARGET_TOKENS, count_tokens
-from processing.claim import claim_ai_extraction
+from processing.claim import claim_ai_extraction, count_ai_extraction_pending
 from processing.json_utils import parse_llm_json, JsonParseError
+from processing.progress import Progress
 from processing.retry import run_with_retries, RetriesExhausted
 from processing.workers import run_worker_pool
 
@@ -529,7 +530,7 @@ def _extract_one(cursor, product):
     return ai_status
 
 
-def _worker(country, remaining, remaining_lock):
+def _worker(country, remaining, remaining_lock, progress):
     """
     One worker's claim loop. claim_ai_extraction() atomically flips a row to
     PROCESSING before this worker starts its (potentially multi-minute,
@@ -557,6 +558,7 @@ def _worker(country, remaining, remaining_lock):
                 conn.commit()
             stats[outcome] = stats.get(outcome, 0) + 1
             logger.info(f"[ai_extraction] product={product['id']} -> {outcome}")
+            progress.advance()
     finally:
         conn.close()
     return stats
@@ -573,10 +575,22 @@ def extract_pending(limit=None, country=None, workers=1):
     """
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            pending = count_ai_extraction_pending(cur, country=country)
+        conn.commit()
+    finally:
+        conn.close()
+    total = min(pending, limit) if limit else pending
+    progress = Progress("ai_extraction", total=total, workers=workers)
+
     totals = run_worker_pool(
         # No sharding needed — see the note in text_extraction.extract_pending.
-        lambda _i, _n: _worker(country, remaining, remaining_lock),
+        lambda _i, _n: _worker(country, remaining, remaining_lock, progress),
         workers, label="ai_extraction"
     )
+    progress.finish()
     logger.info(f"[ai_extraction] done: {totals}")
     return totals
