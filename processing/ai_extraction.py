@@ -49,22 +49,44 @@ from psycopg2.extras import Json, RealDictCursor
 from db import get_db_connection
 from processing.chunking import DEFAULT_TARGET_TOKENS, count_tokens
 from processing.claim import claim_ai_extraction, count_ai_extraction_pending
-from processing.json_utils import parse_llm_json, JsonParseError
+from processing import llm_service_client
 from processing.progress import Progress
 from processing.retry import run_with_retries, RetriesExhausted
 from processing.workers import run_worker_pool
 
 logger = logging.getLogger(__name__)
 
+# The OpenRouter model. Since this stage now runs on the self-hosted LLM first
+# (processing/llm_service_client.py), this is the FALLBACK model — it is what
+# llm_service_client's LLM_FALLBACK_MODEL defaults to, and is only reached when
+# the self-hosted endpoint is unreachable or keeps erroring.
 EXTRACTOR_MODEL = os.getenv("EXTRACTOR_MODEL", "google/gemini-2.5-flash")
 
-# Chunks are ~1800 tokens each (processing/chunking.py) — 7 per call is a
-# few thousand tokens, nowhere near strain on a 1M-token context window, and
-# cuts a 14-chunk document from 14 sequential LLM calls down to 2. The fold
-# still carries the accumulated JSON forward between batches, so accuracy
-# (each call seeing the running result-so-far) is unaffected — this only
-# reduces round-trips.
-CHUNKS_PER_CALL = int(os.getenv("AI_EXTRACTION_CHUNKS_PER_CALL", "7"))
+# Cap on the reply. The fold re-emits the WHOLE accumulated object every call,
+# so this has to be generous or a long product's last calls get truncated
+# mid-array and json_utils has to repair them. Required for the self-hosted
+# path: local servers default this far too low, unlike OpenRouter.
+MAX_COMPLETION_TOKENS = int(os.getenv("AI_EXTRACTION_MAX_TOKENS", "8192"))
+
+# Chat-template overhead that a raw text token count does not include.
+CONTEXT_SAFETY_MARGIN = int(os.getenv("AI_EXTRACTION_SAFETY_MARGIN", "300"))
+# Below this much headroom a call is pointless — the object the fold must
+# re-emit will not fit in what is left, so the batch is split instead.
+MIN_COMPLETION_TOKENS = int(os.getenv("AI_EXTRACTION_MIN_COMPLETION", "512"))
+
+# Chunks are ~1800 tokens each (processing/chunking.py). 7 was right while this
+# stage ran on OpenRouter's 1M-token context: batching cut a 14-chunk document
+# from 14 calls to 2 at no accuracy cost, since the fold still carries the
+# accumulated JSON forward between batches.
+#
+# Now that the self-hosted LLM is the primary provider, the binding constraint
+# is its context window (~22k), which must also hold a ~4.9k system prompt plus
+# an accumulator that grows for the whole fold. At 7 excerpts that overflows on
+# real products and triggers the batch splitting in _fold_slice, and a split
+# re-sends the system prompt and accumulator from scratch — so it costs MORE
+# than the extra round-trip it was meant to save. 5 is the setting that avoids
+# most splits; raise it when pointing this stage back at a large-context model.
+CHUNKS_PER_CALL = int(os.getenv("AI_EXTRACTION_CHUNKS_PER_CALL", "5"))
 
 
 def _batch(items, size):
@@ -295,11 +317,76 @@ tables, approval history, therapeutic equivalents, ...) rather than document pro
 these may appear before, after, or interleaved with document excerpts for the same \
 product. Extract from whatever fields are present the same way regardless of which \
 form an excerpt takes.
+- When a single excerpt lists multiple distinct values for the same field in \
+one sentence (e.g. "available in pack sizes of 14, 21, 56, 60, 84, 90, 100 or 112 \
+capsules", or a paragraph naming several separate clinical trials), you MUST create \
+one separate array entry per distinct value — never one entry that merges, represents, \
+or summarises them. Enumerate exhaustively: if the text names N distinct pack sizes, \
+trials, or list items, your output must contain N entries, not fewer. Under-counting a \
+list this way is a missed extraction, not an acceptable summarisation.
+- When exhaustively enumerating per the rule above, each new entry still carries the \
+OTHER identity fields already established for this same fact elsewhere in the excerpts \
+— do not drop them just because this particular sentence only mentions the one field \
+you are enumerating. Example: if the strength/form/route for this product were already \
+established as 200 mg / hard capsule / oral, and a later sentence says "available in \
+pack sizes of 14, 21, 56...", each resulting presentation entry must still carry \
+strength_value=200, form="hard capsule", route="oral" — not leave them null just \
+because this sentence itself only names the pack size.
+- A label commonly lists MULTIPLE STRENGTHS of the same product family in one \
+sentence (e.g. "Pregabalin Accord 25/50/75/100/150/200/225/300mg hard capsules are \
+available in pack sizes of 14, 21, 56..."). Read carefully which strengths the sentence \
+actually covers:
+  * If the sentence's strength list INCLUDES the exact strength named in "Product:"/\
+"Registration number:" in the user message, the fact DOES apply to this product — \
+extract it. Do NOT skip a fact just because other strengths are also named alongside \
+yours in the same sentence.
+  * Only exclude a fact when it is stated as applying EXCLUSIVELY to a different \
+strength than this product's (e.g. "Additionally, Pregabalin Accord 75mg hard capsules \
+are ALSO available in pack sizes of 70" names only 75mg, not this product — exclude \
+that one fact, but still use the earlier sentence that included your strength).
+- product_data.pivotal_evidence holds EFFICACY trials that support the labelled \
+indications — NOT safety/epidemiology/interaction studies. Skip observational studies \
+about combining this drug with something else, adverse-event odds-ratio studies, and \
+post-marketing surveillance; those inform key_risks instead, never pivotal_evidence.
+  * One entry per DISTINCT STUDY — a distinct patient population plus a distinct \
+primary endpoint — NOT per treatment arm and NOT per dose within that same \
+study/endpoint.
+  * Put the study's own treated-arm result in "value"/"unit", and fold any other \
+arm(s) (placebo, comparator dose, lower dose) into "comparator" as short text, e.g. \
+"Placebo: 18%" or "7 mg/kg/day: not significant". Do NOT create two separate entries \
+for the treatment arm and the placebo arm of the same comparison — that is ONE entry.
+  * A new entry is only warranted when the population or the specific clinical outcome \
+being measured genuinely changes (e.g. adult neuropathic pain vs paediatric seizures vs \
+generalised anxiety disorder are 3 separate studies, so 3 entries) — not for every \
+percentage figure mentioned in the paragraph.
+- The 7 product_data keys (substance, presentations, indications, approval, \
+pivotal_evidence, key_risks, excipients) must ALWAYS be present in your output, even \
+as an empty object/array, for every batch, from the first call onward.
+- "columns" and "product_data" are TWO VIEWS OF THE SAME FACTS, not two independent \
+extraction targets — every fact you put in product_data MUST also be mirrored into the \
+matching flat columns.* field, every single call. Concretely:
+  * Every product_data.presentations[].form -> add to columns.dosage_forms
+  * Every product_data.presentations[].route -> add to columns.routes
+  * Every product_data.presentations[].active_ingredients[].substance and \
+.strength_value+.strength_unit -> add to columns.active_ingredients and columns.strengths \
+respectively
+  * Every product_data.indications[].condition -> add to columns.indications
+  * product_data.substance.inn -> also belongs in columns.active_ingredients if not \
+already present
+If you find yourself about to return a non-empty product_data field alongside an empty \
+columns.* array that should contain the same facts, that is a mistake — go back and \
+populate the columns.* array before returning your answer. This applies from the very \
+first call, not only once product_data has multiple entries.
 - Respond with ONLY the JSON object. No markdown fences, no commentary.
 """
 
 
 def _client():
+    """
+    The OpenRouter client. No longer called on the main path — Stage C goes
+    through llm_service_client, which reaches this only as its fallback (see
+    llm_service_client.get_fallback_client).
+    """
     return OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.getenv("OPEN_ROUTER_API_KEY"),
@@ -307,9 +394,11 @@ def _client():
 
 
 # Running usage/cost totals for the current extract_pending() run, shared
-# across worker threads. OpenRouter only reports per-request cost when the
-# request opts in via `usage.include` (see _call_llm_merge) — without it,
-# response.usage carries token counts but no `cost` field.
+# across worker threads. Counts BOTH providers, so the totals reflect the whole
+# run; the per-provider split (and which of them actually cost money) comes from
+# llm_service_client.provider_stats() in extract_pending's summary. `cost` is
+# only ever populated for OpenRouter — a self-hosted call has no API cost, so
+# the field stays absent and contributes nothing.
 _usage_lock = threading.Lock()
 _usage_totals = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
 
@@ -367,29 +456,78 @@ def _build_user_message(product, accumulated, batch_texts, batch_start, batch_en
     )
 
 
-def _call_llm_merge(product, accumulated, batch_texts, batch_start, batch_end, total):
-    response = _client().chat.completions.create(
-        model=EXTRACTOR_MODEL,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_message(product, accumulated, batch_texts, batch_start, batch_end, total)},
-        ],
-        # Ask OpenRouter to include its per-request cost breakdown in
-        # response.usage (normally omitted) so we can log $ spend, not just
-        # token counts.
-        extra_body={"usage": {"include": True}},
-    )
-    _record_usage(response.usage, product["id"], f"excerpts={batch_start}-{batch_end}/{total}")
-    content = response.choices[0].message.content
-    if not content or not content.strip():
-        raise ValueError("LLM returned an empty response")
+class ContextOverflow(RuntimeError):
+    """
+    The batch does not fit the model's context window.
+
+    Distinct from every other failure because the remedy is the opposite: send
+    LESS, do not retry. Retrying an oversized payload fails identically each
+    time, and failing it over to the other provider does not make it fit either
+    — so this propagates past both the retry loop (see no_retry_on below) and
+    llm_service_client's fallback, up to _fold_slice, which splits the batch.
+    """
+
+
+def _fit_completion_tokens(user_message, context_window):
+    """
+    How many reply tokens are left after the system prompt, the accumulated
+    JSON and this batch's excerpts. Returns (max_tokens, prompt_estimate), with
+    max_tokens None when there is not enough room for a usable reply.
+
+    Done as token arithmetic before the call rather than by waiting for the
+    server to reject it: the pre-check is free, deterministic, and the same
+    answer.
+    """
+    prompt_estimate = count_tokens(SYSTEM_PROMPT) + count_tokens(user_message) + 16
+    available = context_window - prompt_estimate - CONTEXT_SAFETY_MARGIN
+    if available < MIN_COMPLETION_TOKENS:
+        return None, prompt_estimate
+    return max(MIN_COMPLETION_TOKENS, min(MAX_COMPLETION_TOKENS, available)), prompt_estimate
+
+
+def _call_llm_merge(product, accumulated, batch_texts, batch_start, batch_end, total,
+                    context_window):
+    """
+    One fold call, on the self-hosted LLM with an automatic OpenRouter fallback
+    (processing/llm_service_client.py). Raises ContextOverflow when the payload
+    cannot fit, ValueError for anything else the caller should retry.
+    """
+    label = f"excerpts={batch_start}-{batch_end}/{total}"
+    user_message = _build_user_message(
+        product, accumulated, batch_texts, batch_start, batch_end, total)
+
+    max_tokens, prompt_estimate = _fit_completion_tokens(user_message, context_window)
+    if max_tokens is None:
+        raise ContextOverflow(
+            f"prompt ~{prompt_estimate} tokens leaves under {MIN_COMPLETION_TOKENS} "
+            f"for a reply in a {context_window}-token window"
+        )
+
     try:
-        parsed = parse_llm_json(content)
-    except JsonParseError as e:
-        raise ValueError(f"Unparseable LLM JSON: {e}") from e
+        parsed, provider, meta = llm_service_client.call_json(
+            SYSTEM_PROMPT, user_message, max_tokens=max_tokens, temperature=0,
+            json_mode=True, parse_retries=1,
+        )
+    except llm_service_client.LLMServiceError as e:
+        if llm_service_client.is_context_error(e):
+            raise ContextOverflow(str(e)) from e
+        raise ValueError(f"LLM call failed: {e}") from e
+
+    _record_usage(meta.get("usage"), product["id"], f"{label} provider={provider}")
+    if parsed is None:
+        raise ValueError("LLM returned an empty or unparseable response")
     if not isinstance(parsed, dict) or "columns" not in parsed or "product_data" not in parsed:
-        raise ValueError(f"LLM JSON missing columns/product_data sections: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
+        raise ValueError(
+            f"LLM JSON missing columns/product_data sections: "
+            f"{list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}"
+        )
+    if meta.get("finish_reason") == "length":
+        # Not fatal — json_utils closes the object — but the tail of the reply is
+        # genuinely lost, so say so rather than letting it pass silently.
+        logger.warning(
+            f"[ai_extraction] product={product['id']} {label}: reply hit max_tokens "
+            f"({max_tokens}) and was truncated; raise AI_EXTRACTION_MAX_TOKENS"
+        )
     return parsed
 
 
@@ -586,6 +724,88 @@ def _persist_with_regnum_fallback(cursor, product_id, accumulated, ai_status, at
     cursor.execute("RELEASE SAVEPOINT persist_product")
 
 
+_context_window_cache = None
+_context_window_lock = threading.Lock()
+
+
+def _context_window():
+    """
+    The primary provider's context window, discovered once per process.
+
+    Asked of the server (GET /models -> max_model_len) rather than assumed, so
+    a model swap on the GPU does not silently start overflowing; falls back to
+    LLM_SERVICE_CONTEXT_TOKENS when the server does not report one. Cached
+    because every fold call needs it and it cannot change mid-run.
+    """
+    global _context_window_cache
+    if _context_window_cache is None:
+        with _context_window_lock:
+            if _context_window_cache is None:
+                _context_window_cache = llm_service_client.discover_context_window()
+                logger.info(f"[ai_extraction] context window: {_context_window_cache} tokens")
+    return _context_window_cache
+
+
+def _fold_slice(product, accumulated, batch_texts, offset, total, context_window,
+                failed_chunks, depth=0):
+    """
+    Fold one slice of the excerpt list into the accumulator, returning the
+    updated accumulator.
+
+    On a ContextOverflow the slice is halved and each half recursed, so every
+    excerpt is still folded in — at the cost of more, smaller calls — rather
+    than the whole batch being abandoned. This matters much more on the
+    self-hosted model than it did on OpenRouter: with a ~22k window, a long
+    product's accumulator eventually crowds out the excerpts, and without
+    splitting the tail of that product's document would simply never be read.
+
+    An excerpt that overflows even alone cannot be folded at all; it is recorded
+    in `failed_chunks` so the row lands NEEDS_REVIEW instead of a false DONE.
+    """
+    if not batch_texts:
+        return accumulated
+
+    batch_start, batch_end = offset + 1, offset + len(batch_texts)
+    span = f"{batch_start}-{batch_end}"
+    try:
+        return run_with_retries(
+            _call_llm_merge, product, accumulated, batch_texts,
+            batch_start, batch_end, total, context_window,
+            label=f"ai_extraction product={product['id']} excerpts={span}/{total}",
+            # Splitting is the remedy for an overflow, not retrying — see
+            # ContextOverflow. Without this the row waits out the full backoff
+            # three times before the split it needed all along.
+            no_retry_on=(ContextOverflow,),
+        )
+    except ContextOverflow as e:
+        if len(batch_texts) == 1:
+            logger.error(
+                f"[ai_extraction] product={product['id']} excerpt {span}/{total} does not "
+                f"fit the {context_window}-token window even alone ({e}) — skipped. "
+                f"Re-chunk this document with a smaller "
+                f"chunking.DEFAULT_TARGET_TOKENS, or use a larger-context model."
+            )
+            failed_chunks.append((span, f"excerpt exceeds context window: {e}"))
+            return accumulated
+        mid = len(batch_texts) // 2
+        logger.warning(
+            f"[ai_extraction] product={product['id']} excerpts {span}/{total} overflow "
+            f"({e}) — splitting into {batch_start}-{offset + mid} and "
+            f"{offset + mid + 1}-{batch_end}"
+        )
+        accumulated = _fold_slice(product, accumulated, batch_texts[:mid], offset,
+                                  total, context_window, failed_chunks, depth + 1)
+        return _fold_slice(product, accumulated, batch_texts[mid:], offset + mid,
+                           total, context_window, failed_chunks, depth + 1)
+    except RetriesExhausted as e:
+        logger.error(
+            f"[ai_extraction] product={product['id']} excerpts {span}/{total} "
+            f"permanently failed after {e.attempts} attempts: {e.last_exception}"
+        )
+        failed_chunks.append((span, str(e.last_exception)))
+        return accumulated
+
+
 def _extract_one(cursor, product):
     units = _input_units(cursor, product)
     if not units:
@@ -603,23 +823,15 @@ def _extract_one(cursor, product):
     accumulated = {"columns": {}, "product_data": {}}
     failed_chunks = []
     total = len(units)
-    batches = _batch(units, CHUNKS_PER_CALL)
+    context_window = _context_window()
 
-    batch_start = 1
-    for batch_texts in batches:
-        batch_end = batch_start + len(batch_texts) - 1
-        try:
-            accumulated = run_with_retries(
-                _call_llm_merge, product, accumulated, batch_texts, batch_start, batch_end, total,
-                label=f"ai_extraction product={product['id']} excerpts={batch_start}-{batch_end}/{total}",
-            )
-        except RetriesExhausted as e:
-            logger.error(
-                f"[ai_extraction] product={product['id']} excerpts {batch_start}-{batch_end}/{total} "
-                f"permanently failed after {e.attempts} attempts: {e.last_exception}"
-            )
-            failed_chunks.append((f"{batch_start}-{batch_end}", str(e.last_exception)))
-        batch_start = batch_end + 1
+    offset = 0
+    for batch_texts in _batch(units, CHUNKS_PER_CALL):
+        accumulated = _fold_slice(
+            product, accumulated, batch_texts, offset, total,
+            context_window, failed_chunks,
+        )
+        offset += len(batch_texts)
 
     product_data = accumulated.get("product_data") or {}
     has_all_keys = all(key in product_data for key in PRODUCT_DATA_KEYS)
@@ -719,6 +931,19 @@ def extract_pending(limit=None, country=None, workers=1):
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
     _reset_usage_totals()
+    llm_service_client.reset_stats()
+
+    # Confirm a provider answers before claiming any rows. Without this, a dead
+    # self-hosted endpoint with no fallback configured would flip every claimed
+    # row to PROCESSING, fail it, and burn the whole queue's retry budget before
+    # anyone noticed the GPU was down.
+    llm_service_client.health_check()
+    logger.info(
+        f"[ai_extraction] primary: {llm_service_client.LLM_SERVICE_MODEL} @ "
+        f"{llm_service_client.LLM_SERVICE_BASE_URL or '(unset)'} | "
+        f"fallback: {llm_service_client.LLM_FALLBACK_MODEL} "
+        f"({'enabled' if llm_service_client.fallback_available() else 'unavailable'})"
+    )
 
     conn = get_db_connection()
     try:
@@ -737,5 +962,31 @@ def extract_pending(limit=None, country=None, workers=1):
     )
     progress.finish()
     logger.info(f"[ai_extraction] done: {totals}")
-    logger.info(f"[ai_extraction] OpenRouter usage: {_usage_summary()}")
+
+    provider_stats = llm_service_client.provider_stats()
+    calls = provider_stats["calls"]
+    logger.info(
+        f"[ai_extraction] provider split: self-hosted={calls.get('self_hosted', 0)} "
+        f"call(s), OpenRouter={calls.get('openrouter', 0)} call(s)"
+    )
+    if calls.get("openrouter"):
+        # The fallback is a paid API. A run that quietly finished on it looks
+        # identical in the row statuses, so it is called out explicitly here.
+        openrouter = provider_stats["tokens"]["openrouter"]
+        cost = openrouter.get("cost") or 0.0
+        logger.warning(
+            f"[ai_extraction] {calls['openrouter']} call(s) went to the PAID OpenRouter "
+            f"fallback ({llm_service_client.LLM_FALLBACK_MODEL}): "
+            f"{openrouter['prompt']} prompt + {openrouter['completion']} completion tokens"
+            + (f", ${cost:.4f}" if cost else "")
+            + (" — the self-hosted endpoint was degraded for this run"
+               if provider_stats["degraded"] else "")
+        )
+    self_hosted = provider_stats["tokens"]["self_hosted"]
+    if calls.get("self_hosted"):
+        logger.info(
+            f"[ai_extraction] self-hosted usage: {self_hosted['prompt']} prompt + "
+            f"{self_hosted['completion']} completion tokens (no API cost)"
+        )
+    logger.info(f"[ai_extraction] combined usage: {_usage_summary()}")
     return totals

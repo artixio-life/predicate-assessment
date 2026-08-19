@@ -21,7 +21,8 @@ class RetriesExhausted(Exception):
 
 
 def run_with_retries(fn, *args, max_attempts=DEFAULT_MAX_ATTEMPTS,
-                      backoff_seconds=DEFAULT_BACKOFF_SECONDS, label=None, **kwargs):
+                      backoff_seconds=DEFAULT_BACKOFF_SECONDS, label=None,
+                      no_retry_on=(), **kwargs):
     """
     Call fn(*args, **kwargs), retrying on any exception up to `max_attempts`
     total attempts (initial call + retries), with linear backoff
@@ -31,12 +32,21 @@ def run_with_retries(fn, *args, max_attempts=DEFAULT_MAX_ATTEMPTS,
     with the default 3 attempts, matching issue #1's "3 retries per step"
     requirement. Returns fn's result on the first success; raises
     RetriesExhausted if every attempt fails.
+
+    `no_retry_on` is a tuple of exception types that propagate immediately
+    instead of being retried, for failures a retry provably cannot fix. The
+    case this exists for is a context-length overflow in the AI-extraction
+    fold: the same oversized payload fails identically every time, so retrying
+    it three times with backoff just delays the caller's real remedy (sending a
+    smaller batch) by the full backoff.
     """
     name = label or getattr(fn, '__name__', 'call')
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
             return fn(*args, **kwargs)
+        except no_retry_on:
+            raise
         except Exception as e:
             last_exc = e
             if attempt < max_attempts:

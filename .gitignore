@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+local_llm_harness_reports/
+local_llm_results.json
