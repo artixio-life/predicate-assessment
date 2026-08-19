@@ -306,6 +306,49 @@ def _client():
     )
 
 
+# Running usage/cost totals for the current extract_pending() run, shared
+# across worker threads. OpenRouter only reports per-request cost when the
+# request opts in via `usage.include` (see _call_llm_merge) — without it,
+# response.usage carries token counts but no `cost` field.
+_usage_lock = threading.Lock()
+_usage_totals = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
+
+
+def _record_usage(usage, product_id, batch_label):
+    if usage is None:
+        return
+    prompt_tokens = getattr(usage, "prompt_tokens", None) or 0
+    completion_tokens = getattr(usage, "completion_tokens", None) or 0
+    cost = getattr(usage, "cost", None)
+    cost_str = f"${cost:.6f}" if cost is not None else "n/a"
+    logger.info(
+        f"[ai_extraction] usage product={product_id} {batch_label}: "
+        f"prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} cost={cost_str}"
+    )
+    with _usage_lock:
+        _usage_totals["calls"] += 1
+        _usage_totals["prompt_tokens"] += prompt_tokens
+        _usage_totals["completion_tokens"] += completion_tokens
+        if cost is not None:
+            _usage_totals["cost"] += cost
+
+
+def _reset_usage_totals():
+    with _usage_lock:
+        _usage_totals.update(calls=0, prompt_tokens=0, completion_tokens=0, cost=0.0)
+
+
+def _usage_summary():
+    with _usage_lock:
+        totals = dict(_usage_totals)
+    return (
+        f"{totals['calls']} call(s), "
+        f"{totals['prompt_tokens']} prompt tokens, "
+        f"{totals['completion_tokens']} completion tokens, "
+        f"${totals['cost']:.4f} total cost"
+    )
+
+
 def _build_user_message(product, accumulated, batch_texts, batch_start, batch_end, total):
     identity = (
         f"Product: {product.get('product_name') or 'unknown'}\n"
@@ -332,7 +375,12 @@ def _call_llm_merge(product, accumulated, batch_texts, batch_start, batch_end, t
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _build_user_message(product, accumulated, batch_texts, batch_start, batch_end, total)},
         ],
+        # Ask OpenRouter to include its per-request cost breakdown in
+        # response.usage (normally omitted) so we can log $ spend, not just
+        # token counts.
+        extra_body={"usage": {"include": True}},
     )
+    _record_usage(response.usage, product["id"], f"excerpts={batch_start}-{batch_end}/{total}")
     content = response.choices[0].message.content
     if not content or not content.strip():
         raise ValueError("LLM returned an empty response")
@@ -670,6 +718,7 @@ def extract_pending(limit=None, country=None, workers=1):
     """
     remaining = [limit] if limit else None
     remaining_lock = threading.Lock()
+    _reset_usage_totals()
 
     conn = get_db_connection()
     try:
@@ -688,4 +737,5 @@ def extract_pending(limit=None, country=None, workers=1):
     )
     progress.finish()
     logger.info(f"[ai_extraction] done: {totals}")
+    logger.info(f"[ai_extraction] OpenRouter usage: {_usage_summary()}")
     return totals
