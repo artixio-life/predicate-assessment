@@ -31,9 +31,10 @@ _EXTRACTORS = {}
 
 def _load_extractors():
     if not _EXTRACTORS:
-        from processing import saudi_manual_extraction, us_manual_extraction
+        from processing import australia_manual_extraction, saudi_manual_extraction, us_manual_extraction
         _EXTRACTORS["Saudi Arabia"] = saudi_manual_extraction.extract
         _EXTRACTORS["United States"] = us_manual_extraction.extract
+        _EXTRACTORS["Australia"] = australia_manual_extraction.extract
     return _EXTRACTORS
 
 

@@ -545,21 +545,18 @@ def approval_from(json_data, document_text, sections):
 
 # --------------------------------------------------------------- label prose
 
-# Indications live in prose, but SPL 'indications_and_usage' is formulaic
-# enough that the indicated conditions can be pulled by rule.
-# 'X is indicated [in combination with Y] for the treatment of Z' — the
-# combination clause is a co-administration instruction sitting between the
-# trigger and the condition, so it is skipped over rather than captured.
-_INDICATION_RE = re.compile(
-    r"indicated\s+"
-    r"(?:(?:in|for\s+use\s+in)\s+(?:combination|conjunction)\s+with\s+[^.;:]{2,60}?\s+)?"
-    r"(?:for\s+(?:the\s+)?(?:treatment|management|prevention|relief|reduction|"
-    r"prophylaxis|control|induction)\s+of\s+"
-    r"|(?:for|in)\s+(?:the\s+)?(?:use\s+in\s+)?"
-    r"|to\s+(?:treat|prevent|reduce|control)\s+)"
-    r"(?P<what>[^.;:]{4,180})",
-    re.I,
-)
+# Indications live in prose. SPL 'indications_and_usage' is formulaic enough
+# ('X is indicated for the treatment of Z') that a regex CAN carve out just
+# the condition phrase — an earlier version of this function did exactly
+# that. But the carve-out is itself a source of error on the one field a
+# reviewer leans on most: the wrong split point, a swallowed or truncated
+# clause, a phrase that reads wrong out of context. Since this module's whole
+# premise is "map deterministically, don't introduce a claim the source
+# doesn't literally support," indications_from now keeps the WHOLE sentence
+# verbatim instead of trying to extract just the disease name from it. This
+# still needs a trigger to decide which sentences ARE indication statements —
+# "indicated" is what the label itself uses for this — but past that trigger,
+# nothing is reworded, trimmed, or split.
 _POPULATION_RE = re.compile(
     r"\b(adults?(?:\s+and\s+(?:paediatric|pediatric|children)[^,.;]{0,60})?"
     r"|p(?:a)?ediatric\s+patients?[^,.;]{0,60}|children[^,.;]{0,40}|neonates?|adolescents?)\b",
@@ -567,36 +564,74 @@ _POPULATION_RE = re.compile(
 )
 
 
-def indications_from(sections, approval_date):
+def _name_anchors(json_data):
+    """
+    Known brand/ingredient names for THIS product, used only to find where a
+    real sentence starts inside indications_from's output — never to alter or
+    supply the indication content itself. SPL section/subsection headings
+    ('1 INDICATIONS AND USAGE', '1.1 Mantle Cell Lymphoma') have no
+    sentence-ending punctuation, so splitting text on '. ' glues the heading
+    onto the front of the next real sentence. A generic shape-based rule
+    can't reliably tell a heading from a genuine sentence opener, but this
+    record's OWN stated names can: real indication sentences start with the
+    product's brand or ingredient name ('JAYPIRCA is indicated for...'), so
+    trimming to the earliest of those known strings removes the glued-on
+    heading without touching anything the label actually says.
+    """
+    anchors = set()
+    openfda = json_data.get("openfda") or {}
+    for name in (openfda.get("brand_name") or []):
+        if name and len(str(name).strip()) >= 3:
+            anchors.add(str(name).strip())
+    for p in (json_data.get("products") or []):
+        if not isinstance(p, dict):
+            continue
+        if p.get("drug_name") and len(str(p["drug_name"]).strip()) >= 3:
+            anchors.add(str(p["drug_name"]).strip())
+        for ing in _split_ingredients(p):
+            if len(ing) >= 3:
+                anchors.add(ing)
+    return anchors
+
+
+def _trim_heading_prefix(sentence, name_anchors):
+    """See _name_anchors. Leaves the sentence untouched if no known name is
+    found in it — no known anchor means no defensible trim point, not a
+    license to guess one."""
+    lower = sentence.lower()
+    positions = [p for p in (lower.find(a.lower()) for a in name_anchors) if p >= 0]
+    return sentence[min(positions):] if positions else sentence
+
+
+def indications_from(json_data, sections):
+    """
+    One entry per SENTENCE containing 'indicated', stored as the full
+    sentence — not a regex-extracted condition phrase — after trimming any
+    glued-on section-heading prefix (see _trim_heading_prefix). `population`
+    is still pulled separately (a same-window regex match, not a rewording of
+    the sentence itself), since it's an addition alongside the verbatim text
+    rather than a substitute for any part of it.
+    """
     text = sections.get("indications_and_usage")
     if not text:
         return []
+    anchors = _name_anchors(json_data)
     out, seen = [], set()
-    for m in _INDICATION_RE.finditer(text):
-        what = _clean(m.group("what"))
-        if not what:
+    for sentence in re.split(r"(?<=[.!])\s+(?=[A-Z(])", text):
+        sentence = _clean(sentence)
+        if not sentence or "indicated" not in sentence.lower():
             continue
-        # Trim trailing clause noise the regex swallowed.
-        what = re.split(r"\s+(?:in patients|when|who|as |for the )", what, maxsplit=1)[0]
-        # Two overlapping matches on the same sentence produce one string that
-        # is a prefix of the other; keep the shorter, more canonical one.
-        what = _clean(what)
-        if what and any(what.lower().startswith(s[:40].lower()) or
-                        s.lower().startswith(what[:40].lower()) for s in seen):
+        sentence = _trim_heading_prefix(sentence, anchors)
+        key = sentence.lower()
+        if key in seen:
             continue
-        what = _clean(what)
-        if not what or len(what) < 4 or what.lower() in seen:
-            continue
-        # 'indicated for use in combination with other antiretroviral agents'
-        # describes how the drug is given, not what it treats.
-        if re.match(r"^(?:combination|use\s+in\s+combination|conjunction)\b", what, re.I):
-            continue
-        seen.add(what.lower())
-        seen_full = None
-        window = text[max(0, m.start() - 120): m.end() + 120]
+        seen.add(key)
+        start = text.find(sentence)
+        window = (text[max(0, start - 120): start + len(sentence) + 120]
+                  if start >= 0 else sentence)
         pop = _POPULATION_RE.search(window)
         out.append({
-            "condition": what[0].upper() + what[1:],
+            "condition": sentence,
             "population": _clean(pop.group(0)).lower() if pop else None,
             "line_of_therapy": None,
             "biomarker": None,
@@ -825,7 +860,7 @@ def columns_from(json_data, document_text, sections, presentations, substance, a
         "reference_product": approval["reference_product"],
         "source_language": "en",
         "therapeutic_areas": [],  # requires clinical judgement — left to review
-        "indications": [i["condition"] for i in indications_from(sections, approval_date)],
+        "indications": [i["condition"] for i in indications_from(json_data, sections)],
         "symptoms": [],
         "adverse_reactions": [],
         "contraindications": [],
@@ -854,7 +889,7 @@ def extract(json_data, document_text=None):
     presentations = _dedupe_presentations([build_presentation(p) for p in products])
     substance = substance_from(json_data, presentations, sections)
     approval = approval_from(json_data, document_text, sections)
-    indications = indications_from(sections, approval)
+    indications = indications_from(json_data, sections)
     columns = columns_from(json_data, document_text, sections,
                            presentations, substance, approval)
 
@@ -880,7 +915,8 @@ def extract(json_data, document_text=None):
                                        if approval["reference_product"] else "unavailable"),
         "approval.priority_review": ("field map (approval_history review_priority)"
                                       if approval["priority_review"] is not None else "unavailable"),
-        "indications": ("regex (SPL indications_and_usage)" if indications else "unavailable"),
+        "indications": ("verbatim sentence (SPL indications_and_usage, 'indicated' trigger — "
+                        "not a regex-carved condition phrase)" if indications else "unavailable"),
         "key_risks": ("regex (SPL boxed_warning / warnings)"
                       if product_data["key_risks"] else "unavailable"),
         "pivotal_evidence": ("regex (SPL clinical_studies)"
