@@ -306,12 +306,17 @@ and diffs the two. The report lands in `local_llm_harness_reports/`.
 `processing/llm_service_client.py` tries the self-hosted endpoint, then
 OpenRouter. Two behaviours are worth knowing before you read any numbers:
 
-- **Sticky degradation.** A single failure is a blip and the next call still
+- **Degrade, then recover.** A single failure is a blip and the next call still
   prefers the GPU; after `LLM_SERVICE_FALLBACK_AFTER` (default 2) consecutive
-  failures the run sticks to OpenRouter. The summary prints
-  `providers: {'self_hosted': N, 'openrouter': M}` and warns explicitly when
-  the run degraded — a benchmark that silently finished on the paid API would
-  otherwise look like a passing local model.
+  failures the run switches to OpenRouter — but only for
+  `LLM_SERVICE_RECOVERY_AFTER` seconds (default 60), after which one caller
+  re-probes self-hosted and the run returns to it the moment it answers. A
+  failed probe doubles the cooldown up to `LLM_SERVICE_RECOVERY_MAX`, so a dead
+  endpoint is checked rarely rather than once per product, and only one probe
+  runs at a time so N workers do not all retry a dead endpoint together.
+  Self-hosted is always the preferred provider; the fallback is never permanent.
+  The summary prints `providers: {'self_hosted': N, 'openrouter': M}` and warns
+  explicitly when any call hit the paid API.
 - **Context overflow is never failed over.** A payload that overflows one
   model's window overflows the other's too, and unlike a dead endpoint it says
   nothing about the service's health. Such a batch is *split* instead, and the

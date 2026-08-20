@@ -58,9 +58,18 @@ LLM_FALLBACK_MODEL = os.getenv(
     "LLM_FALLBACK_MODEL",
     os.getenv("EXTRACTOR_MODEL", "google/gemini-2.5-flash"),
 )
-# Consecutive self-hosted failures before the run stops trying it. Without this
-# every product pays the full retry/backoff cost against a dead endpoint.
+# Consecutive self-hosted failures before the run stops preferring it. Without
+# this every product pays the full retry/backoff cost against a dead endpoint.
 LLM_FALLBACK_AFTER_FAILURES = int(os.getenv("LLM_SERVICE_FALLBACK_AFTER", "2"))
+
+# How long to stay on the fallback before re-probing the self-hosted endpoint.
+# Degradation used to be permanent for the run, which meant a 90-second
+# llm-service restart pushed an entire multi-hour run onto the paid API and it
+# never came back. The cooldown doubles on each failed probe up to
+# LLM_SERVICE_RECOVERY_MAX, so a genuinely dead endpoint still stops costing a
+# retry per product, while a transient blip costs only one cooldown.
+LLM_SERVICE_RECOVERY_SECONDS = int(os.getenv("LLM_SERVICE_RECOVERY_AFTER", "60"))
+LLM_SERVICE_RECOVERY_MAX = int(os.getenv("LLM_SERVICE_RECOVERY_MAX", "900"))
 
 SELF_HOSTED = "self_hosted"
 OPENROUTER = "openrouter"
@@ -72,8 +81,15 @@ _client_lock = threading.Lock()
 _semaphore = threading.Semaphore(LLM_SERVICE_CONCURRENCY)
 
 _provider_lock = threading.Lock()
-_degraded = False            # True once the run stops trying the self-hosted service
+_degraded = False            # True while the run prefers the fallback
 _consecutive_failures = 0
+# Monotonic deadline after which ONE caller may re-probe the self-hosted
+# endpoint. Only one probe runs at a time (_probe_in_flight): with several
+# workers, letting them all retry a dead endpoint simultaneously would pay the
+# full retry/backoff cost N times over for no extra information.
+_recovery_at = 0.0
+_recovery_delay = 0.0
+_probe_in_flight = False
 _call_counts = {SELF_HOSTED: 0, OPENROUTER: 0}
 _token_counts = {
     SELF_HOSTED: {"prompt": 0, "completion": 0},
@@ -121,10 +137,28 @@ def fallback_available():
 
 
 def current_provider():
+    """
+    Which provider the next call should use.
+
+    Self-hosted is always preferred. While degraded the fallback is used, EXCEPT
+    that the first caller past the cooldown is elected to re-probe self-hosted —
+    so a recovered endpoint is picked back up automatically instead of the run
+    finishing on the paid API.
+    """
+    global _probe_in_flight
+    if not LLM_SERVICE_BASE_URL:
+        return OPENROUTER
     with _provider_lock:
-        if _degraded:
-            return OPENROUTER
-    return SELF_HOSTED if LLM_SERVICE_BASE_URL else OPENROUTER
+        if not _degraded:
+            return SELF_HOSTED
+        if not _probe_in_flight and time.monotonic() >= _recovery_at:
+            _probe_in_flight = True
+            logger.info(
+                f"[llm_service] re-probing self-hosted LLM after "
+                f"{_recovery_delay:.0f}s on the fallback"
+            )
+            return SELF_HOSTED
+        return OPENROUTER
 
 
 def provider_stats():
@@ -134,14 +168,20 @@ def provider_stats():
             "calls": dict(_call_counts),
             "tokens": {k: dict(v) for k, v in _token_counts.items()},
             "degraded": _degraded,
+            "recovery_in_s": (max(0.0, _recovery_at - time.monotonic())
+                              if _degraded else None),
         }
 
 
 def reset_stats():
-    global _degraded, _consecutive_failures
+    global _degraded, _consecutive_failures, _recovery_at, _recovery_delay
+    global _probe_in_flight
     with _provider_lock:
         _degraded = False
         _consecutive_failures = 0
+        _recovery_at = 0.0
+        _recovery_delay = 0.0
+        _probe_in_flight = False
         for provider in _call_counts:
             _call_counts[provider] = 0
         _token_counts[SELF_HOSTED].update(prompt=0, completion=0)
@@ -150,27 +190,46 @@ def reset_stats():
 
 def _mark_failure():
     """
-    Record a self-hosted failure; return True once the run should give up on it.
+    Record a self-hosted failure; return True if the run should now prefer the
+    fallback.
 
-    Sticky by design: a service that is down stays down for the rest of a run,
-    and re-probing it per product just burns the retry budget.
+    Not sticky any more. Degrading arms a cooldown, after which one caller
+    re-probes self-hosted (see current_provider). A failed probe doubles the
+    cooldown, so a dead endpoint converges on "checked rarely" rather than
+    "never checked again".
     """
-    global _degraded, _consecutive_failures
+    global _degraded, _consecutive_failures, _recovery_at, _recovery_delay
+    global _probe_in_flight
     with _provider_lock:
         _consecutive_failures += 1
-        if (not _degraded and fallback_available()
+        was_probing, _probe_in_flight = _probe_in_flight, False
+
+        if was_probing:
+            # The probe failed: back off further before the next one.
+            _recovery_delay = min(LLM_SERVICE_RECOVERY_MAX,
+                                  max(LLM_SERVICE_RECOVERY_SECONDS,
+                                      _recovery_delay * 2))
+            _recovery_at = time.monotonic() + _recovery_delay
+            logger.warning(
+                f"[llm_service] self-hosted probe failed — staying on the "
+                f"fallback for another {_recovery_delay:.0f}s"
+            )
+        elif (not _degraded and fallback_available()
                 and _consecutive_failures >= LLM_FALLBACK_AFTER_FAILURES):
             _degraded = True
+            _recovery_delay = LLM_SERVICE_RECOVERY_SECONDS
+            _recovery_at = time.monotonic() + _recovery_delay
             logger.warning(
                 f"[llm_service] self-hosted LLM failed {_consecutive_failures}x — "
-                f"switching this run to the OpenRouter fallback "
-                f"({LLM_FALLBACK_MODEL}). NOTE: paid API."
+                f"using the OpenRouter fallback ({LLM_FALLBACK_MODEL}) and "
+                f"re-probing in {_recovery_delay:.0f}s. NOTE: paid API."
             )
         return _degraded
 
 
 def _mark_success(provider, usage=None):
-    global _consecutive_failures
+    global _consecutive_failures, _degraded, _recovery_at, _recovery_delay
+    global _probe_in_flight
     with _provider_lock:
         _call_counts[provider] = _call_counts.get(provider, 0) + 1
         if usage is not None:
@@ -182,14 +241,32 @@ def _mark_success(provider, usage=None):
                 bucket["cost"] += cost
         if provider == SELF_HOSTED:
             _consecutive_failures = 0
+            _probe_in_flight = False
+            if _degraded:
+                # The probe answered: come straight back off the paid API.
+                _degraded = False
+                _recovery_at = 0.0
+                _recovery_delay = 0.0
+                logger.warning(
+                    "[llm_service] self-hosted LLM is answering again — "
+                    "returning to it and off the OpenRouter fallback"
+                )
 
 
 def force_fallback(reason=""):
-    """Switch the run to OpenRouter immediately (used when the health check fails)."""
-    global _degraded
+    """
+    Switch to OpenRouter immediately (used when the startup health check fails).
+
+    Arms the same recovery cooldown as a mid-run failure: an llm-service that was
+    merely restarting when the job started should be picked up minutes later, not
+    written off for the whole run.
+    """
+    global _degraded, _recovery_at, _recovery_delay
     with _provider_lock:
         if not _degraded:
             _degraded = True
+            _recovery_delay = LLM_SERVICE_RECOVERY_SECONDS
+            _recovery_at = time.monotonic() + _recovery_delay
             logger.warning(
                 f"[llm_service] using OpenRouter fallback ({LLM_FALLBACK_MODEL})"
                 f"{f': {reason}' if reason else ''}. NOTE: paid API."

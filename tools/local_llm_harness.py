@@ -68,11 +68,17 @@ logger = logging.getLogger("harness")
 CHUNKS_PER_CALL = int(os.getenv("LOCAL_LLM_CHUNKS_PER_CALL", "5"))
 PRODUCTION_CHUNKS_PER_CALL = ai.CHUNKS_PER_CALL
 MAX_RETRIES = 3
-DEFAULT_MAX_TOKENS = int(os.getenv("LOCAL_LLM_MAX_TOKENS", "8192"))
+# Matches ai_extraction.MAX_COMPLETION_TOKENS. Kept modest on purpose: vLLM
+# reserves KV cache for the declared max_tokens and defers requests it cannot
+# fit, so over-declaring costs concurrency rather than buying safety.
+DEFAULT_MAX_TOKENS = int(os.getenv("LOCAL_LLM_MAX_TOKENS", "3072"))
 
-# Message-formatting overhead (role wrappers, chat template tokens) that
-# tiktoken's raw text count does not include.
+# Headroom between our estimate and the server's real count: chat-template
+# overhead plus the tokeniser mismatch (cl100k vs the served model's own vocab,
+# measured 1.68% low on Gemma). Proportional with a floor — see
+# ai_extraction._safety_margin.
 CONTEXT_SAFETY_MARGIN = int(os.getenv("LOCAL_LLM_SAFETY_MARGIN", "300"))
+CONTEXT_SAFETY_RATIO = float(os.getenv("LOCAL_LLM_SAFETY_RATIO", "0.06"))
 # Below this much room for a reply, sending the batch is pointless — the object
 # the fold must re-emit will not fit, so split instead.
 MIN_COMPLETION_TOKENS = int(os.getenv("LOCAL_LLM_MIN_COMPLETION", "512"))
@@ -241,7 +247,8 @@ def _fits(messages, requested_max_tokens, context_window):
     when there is not enough room left for a usable reply.
     """
     prompt_estimate = sum(count_tokens(m["content"]) for m in messages) + 16
-    available = context_window - prompt_estimate - CONTEXT_SAFETY_MARGIN
+    available = context_window - prompt_estimate - max(
+        CONTEXT_SAFETY_MARGIN, int(prompt_estimate * CONTEXT_SAFETY_RATIO))
     if available < MIN_COMPLETION_TOKENS:
         return None, prompt_estimate
     return max(MIN_COMPLETION_TOKENS, min(requested_max_tokens, available)), prompt_estimate

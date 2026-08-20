@@ -614,6 +614,15 @@ _RISK_STOP = {
 }
 
 
+# Words that plausibly START the body sentence after an SPL subsection heading,
+# and never end a Title Case heading. Used to peel over-captured headings.
+_SENTENCE_OPENERS = frozenset((
+    "as", "in", "the", "use", "this", "if", "when", "a", "an", "for", "to",
+    "of", "and", "or", "with", "patients", "avoid", "do", "monitor", "dual",
+    "consider", "either", "correct", "there", "it", "these", "because",
+))
+
+
 def key_risks_from(sections):
     boxed = sections.get("boxed_warning")
     risks = []
@@ -647,7 +656,17 @@ def key_risks_from(sections):
                 # rather than closing the heading — drop it.
                 if re.match(r"\s+[a-z]", text[m.end():m.end() + 3] or ""):
                     phrase = phrase.rsplit(" ", 1)[0]
-                phrase = _clean(_TRAILING_CONNECTOR_RE.sub("", phrase))
+                # ONE strip is not always enough: the run's lowercase-connector
+                # alternation lets it swallow a sentence opener AND its article,
+                # e.g. '5.4 Impaired Hepatic Function As the majority of ...'
+                # captures '... Function As the', which the single strip above
+                # leaves as '... Function As'. Keep peeling while the tail is a
+                # word that opens a sentence rather than ending a Title Case
+                # heading.
+                words = phrase.split()
+                while len(words) > 1 and words[-1].lower() in _SENTENCE_OPENERS:
+                    words.pop()
+                phrase = _clean(_TRAILING_CONNECTOR_RE.sub("", " ".join(words)))
                 if not phrase or len(phrase) <= 4:
                     continue
                 # A boxed-warning heading and its W&P subsection heading are
@@ -671,17 +690,44 @@ _DESIGN_RE = re.compile(
 _STUDY_ID_RE = re.compile(r"\b(?:Study|Trial|Protocol)\s+([A-Z0-9][A-Z0-9\-]{2,15})\b")
 
 
+# A US label's reliable study_id is a named trial acronym (ONTARGET, TRANSCEND).
+# The stop list keeps section boilerplate and units out.
+_TRIAL_NAME_RE = re.compile(r"\b([A-Z][A-Z0-9\-]{4,20})\b")
+_TRIAL_NAME_STOP = frozenset((
+    "CLINICAL", "STUDIES", "ADVERSE", "REACTIONS", "WARNINGS", "TABLE", "NOTE",
+    "DOSAGE", "USAGE", "MMHG", "USP", "ACE", "ARBS", "INDICATIONS", "PRECAUTIONS",
+    "OVERDOSAGE", "DESCRIPTION", "CONTRAINDICATIONS", "PATIENTS", "PLACEBO",
+))
+
+
 def pivotal_evidence_from(sections):
+    """
+    One entry per SENTENCE describing a trial, rather than per design phrase
+    found anywhere in the section.
+
+    Sentence scoping is what prevents cross-contamination: a section describing
+    ONTARGET and then TRANSCEND previously paired the first design phrase with
+    whichever enrolment count appeared next in a 500-character window, yielding
+    an entry ('double-blind study', n=2954) whose design came from one trial and
+    whose N came from the other — a fact that is in neither.
+    """
     text = sections.get("clinical_studies")
     if not text:
         return []
-    out = []
-    for m in _DESIGN_RE.finditer(text):
-        window = text[m.start(): m.start() + 500]
-        n = _N_RE.search(window)
-        sid = _STUDY_ID_RE.search(text[max(0, m.start() - 200): m.start() + 200])
+    out, seen = [], set()
+    for sentence in re.split(r"(?<=[.])\s+(?=[A-Z(])", text):
+        m = _DESIGN_RE.search(sentence)
+        if not m:
+            continue
+        n = _N_RE.search(sentence)
+        sid = _STUDY_ID_RE.search(sentence)
+        study_id = sid.group(1) if sid else None
+        if not study_id:
+            names = [t for t in _TRIAL_NAME_RE.findall(sentence)
+                     if t not in _TRIAL_NAME_STOP]
+            study_id = names[0] if names else None
         entry = {
-            "study_id": sid.group(1) if sid else None,
+            "study_id": study_id,
             "design": _clean(m.group(1)).lower(),
             "n": int(n.group(1)) if n else None,
             # Endpoint/value/outcome are stated too variably across labels to
@@ -689,12 +735,51 @@ def pivotal_evidence_from(sections):
             "endpoint": None, "value": None, "unit": None,
             "comparator": None, "outcome": None,
         }
-        if entry not in out:
-            out.append(entry)
+        key = (entry["study_id"], entry["design"], entry["n"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(entry)
     return out[:6]
 
 
 # ------------------------------------------------------------------- columns
+
+# 'The tablets contain the following inactive ingredients: crospovidone, lactose
+# monohydrate, magnesium stearate, meglumine, povidone and sodium hydroxide
+# pellets.' — near-fixed phrasing across US labels, so the list IS
+# rule-extractable from SPL prose even though Drugs@FDA publishes no structured
+# excipient field.
+_EXCIPIENT_RE = re.compile(
+    r"inactive\s+ingredient(?:s)?\s*(?:are|include|:)?\s*:?\s*(?P<list>[^.]{5,400})",
+    re.I)
+# Trailing dosage-form nouns the sentence ends on, not part of the excipient name.
+_EXCIPIENT_TAIL_RE = re.compile(r"\s+(pellets|powder|granules|q\.s\.)$", re.I)
+
+
+def excipients_from(sections):
+    """
+    Excipient NAMES only. US labels state the formulation qualitatively and
+    essentially never give a per-dosage-unit quantity, so value/unit stay null
+    rather than being invented — product_data_spec.md's excipient note says a
+    missing quantity is normal and must not be guessed.
+    """
+    for key in ("description", "inactive_ingredient", "spl_patient_package_insert"):
+        m = _EXCIPIENT_RE.search(sections.get(key) or "")
+        if not m:
+            continue
+        out, seen = [], set()
+        for part in re.split(r",|\band\b", m.group("list")):
+            name = _clean(_EXCIPIENT_TAIL_RE.sub("", _clean(part) or ""))
+            if not name or len(name) < 3 or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append({"name": _title(name), "name_local": None,
+                        "value": None, "unit": None})
+        if out:
+            return out[:30]
+    return []
+
 
 def columns_from(json_data, document_text, sections, presentations, substance, approval):
     openfda = json_data.get("openfda") or {}
@@ -781,7 +866,7 @@ def extract(json_data, document_text=None):
         "approval": approval,
         "pivotal_evidence": pivotal_evidence_from(sections),
         "key_risks": key_risks_from(sections),
-        "excipients": [],  # not published in Drugs@FDA structured data
+        "excipients": excipients_from(sections),
     }
     provenance = {
         "substance.inn": "field map (products[].active_ingredients + salt strip)",
@@ -800,6 +885,7 @@ def extract(json_data, document_text=None):
                       if product_data["key_risks"] else "unavailable"),
         "pivotal_evidence": ("regex (SPL clinical_studies)"
                              if product_data["pivotal_evidence"] else "unavailable"),
-        "excipients": "unavailable",
+        "excipients": ("regex (SPL inactive-ingredient list)"
+                       if product_data["excipients"] else "unavailable"),
     }
     return {"columns": columns, "product_data": product_data, "provenance": provenance}

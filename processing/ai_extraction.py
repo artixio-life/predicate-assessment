@@ -62,14 +62,37 @@ logger = logging.getLogger(__name__)
 # the self-hosted endpoint is unreachable or keeps erroring.
 EXTRACTOR_MODEL = os.getenv("EXTRACTOR_MODEL", "google/gemini-2.5-flash")
 
-# Cap on the reply. The fold re-emits the WHOLE accumulated object every call,
-# so this has to be generous or a long product's last calls get truncated
-# mid-array and json_utils has to repair them. Required for the self-hosted
-# path: local servers default this far too low, unlike OpenRouter.
-MAX_COMPLETION_TOKENS = int(os.getenv("AI_EXTRACTION_MAX_TOKENS", "8192"))
+# Cap on the reply. The fold re-emits the WHOLE accumulated object every call, so
+# this must cover the largest accumulated object, not the largest excerpt.
+#
+# Sized from measurement, not headroom: observed completions run ~1,000-1,600
+# tokens and the largest stored accumulator across every DONE row is ~3,560.
+# Over-declaring is NOT free on vLLM — the scheduler reserves KV cache for the
+# declared max_tokens, and defers requests it cannot guarantee that space for
+# (visible as `Deferred: N reqs` alongside `Running: 1`), so an 8192 default
+# throttled concurrency to a fraction of what the GPU could actually run.
+# Truncation is recoverable anyway: json_utils closes a cut-off object and
+# _call_llm_merge logs a warning naming this variable.
+MAX_COMPLETION_TOKENS = int(os.getenv("AI_EXTRACTION_MAX_TOKENS", "3072"))
 
-# Chat-template overhead that a raw text token count does not include.
+# Headroom between our token estimate and the server's real count.
+#
+# Two sources of error, and only one of them is a constant:
+#   - chat-template overhead (role wrappers, BOS/EOS): a fixed handful of tokens
+#   - TOKENISER MISMATCH: count_tokens uses tiktoken cl100k_base, but the served
+#     model has its own tokeniser. Gemma's SentencePiece vocab measured 1.68%
+#     HIGHER than cl100k on real fold payloads (17,872 actual vs 17,571
+#     estimated). That error is PROPORTIONAL to prompt size, so a flat margin
+#     silently stops covering it as prompts grow — at a 17.5k prompt a 300-token
+#     margin is exactly consumed, and the request lands 1 token over the limit.
+# Hence a ratio with a flat floor, rather than a constant.
 CONTEXT_SAFETY_MARGIN = int(os.getenv("AI_EXTRACTION_SAFETY_MARGIN", "300"))
+CONTEXT_SAFETY_RATIO = float(os.getenv("AI_EXTRACTION_SAFETY_RATIO", "0.06"))
+
+
+def _safety_margin(prompt_estimate):
+    """Headroom to reserve for a prompt we estimated at `prompt_estimate`."""
+    return max(CONTEXT_SAFETY_MARGIN, int(prompt_estimate * CONTEXT_SAFETY_RATIO))
 # Below this much headroom a call is pointless — the object the fold must
 # re-emit will not fit in what is left, so the batch is split instead.
 MIN_COMPLETION_TOKENS = int(os.getenv("AI_EXTRACTION_MIN_COMPLETION", "512"))
@@ -479,7 +502,7 @@ def _fit_completion_tokens(user_message, context_window):
     answer.
     """
     prompt_estimate = count_tokens(SYSTEM_PROMPT) + count_tokens(user_message) + 16
-    available = context_window - prompt_estimate - CONTEXT_SAFETY_MARGIN
+    available = context_window - prompt_estimate - _safety_margin(prompt_estimate)
     if available < MIN_COMPLETION_TOKENS:
         return None, prompt_estimate
     return max(MIN_COMPLETION_TOKENS, min(MAX_COMPLETION_TOKENS, available)), prompt_estimate
