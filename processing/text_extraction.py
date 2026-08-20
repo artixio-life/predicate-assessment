@@ -21,11 +21,19 @@ from db import get_db_connection
 from processing import mistral_ocr
 from processing.chunking import chunk_text
 from processing.claim import claim_text_extraction, count_text_extraction_pending
+from processing.eu_section_extraction import extract_annex_iii
 from processing.progress import Progress
 from processing.retry import run_with_retries, RetriesExhausted
 from processing.workers import run_worker_pool
 
 logger = logging.getLogger(__name__)
+
+# Countries whose document_text is a large structured regulatory PDF where
+# only one section is worth chunking for the LLM fold — see each function's
+# module docstring for why. Keyed by drug.regulatory_geography.country_name.
+_SECTION_EXTRACTORS = {
+    "European Union": extract_annex_iii,
+}
 
 # Below this average chars/page, treat pdf-inspector's text-layer result as
 # unusable even if it classified the PDF as text_based — mirrors
@@ -55,6 +63,27 @@ def _extract_document_text(file_bytes: bytes, filename: str) -> str:
     return text
 
 
+def _select_chunk_source(document_text, country_name, filename):
+    """
+    Most countries chunk the full document_text. A country in
+    _SECTION_EXTRACTORS instead chunks only the section its extractor
+    returns — falling back to the full document if that section isn't
+    found (e.g. a template shape the extractor doesn't recognise yet), so a
+    miss degrades to today's behaviour rather than producing zero chunks.
+    """
+    extractor = _SECTION_EXTRACTORS.get(country_name)
+    if not extractor:
+        return document_text
+    section = extractor(document_text)
+    if section:
+        return section
+    logger.warning(
+        f"[text_extraction] {filename}: {country_name} section extractor found nothing — "
+        f"falling back to chunking the full document_text"
+    )
+    return document_text
+
+
 def _process_one(cursor, product):
     source_url = product["source_url"]
     filename = os.path.basename(source_url)
@@ -64,7 +93,8 @@ def _process_one(cursor, product):
     if not document_text or not document_text.strip():
         raise ValueError(f"No text could be extracted from {source_url}")
 
-    chunks = chunk_text(document_text)
+    chunk_source = _select_chunk_source(document_text, product.get("country_name"), filename)
+    chunks = chunk_text(chunk_source)
 
     cursor.execute(
         """

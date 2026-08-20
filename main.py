@@ -34,11 +34,16 @@ def main():
     if os.getenv("RUN_LLM_FIX", "false").lower() == "true":
         from processing import llm_field_repair
         dry_run = os.getenv("RUN_LLM_FIX_DRY_RUN", "false").lower() == "true"
+        # Its own worker count, separate from PIPELINE_WORKERS: this stage's
+        # concurrency is bounded by the LLM provider's rate limit, not by the
+        # CPU/DB budget the other stages are tuned against.
+        fix_workers = int(os.getenv("RUN_LLM_FIX_WORKERS", "4"))
         logger.info(
-            f"=== LLM field repair (RUN_LLM_FIX=true) === {country or 'Australia'}"
-            f"{' [DRY RUN]' if dry_run else ''}"
+            f"=== LLM field repair (RUN_LLM_FIX=true) === {country or 'Australia'} "
+            f"[{fix_workers} worker(s)]{' [DRY RUN]' if dry_run else ''}"
         )
-        llm_field_repair.run(country=country or "Australia", limit=limit, dry_run=dry_run)
+        llm_field_repair.run(country=country or "Australia", limit=limit,
+                             dry_run=dry_run, workers=fix_workers)
 
 
 if __name__ == "__main__":

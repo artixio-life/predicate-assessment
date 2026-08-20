@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # (fsync) that dominated Stage A's runtime.
 BATCH_SIZE = int(os.getenv("PROMOTE_BATCH_SIZE", "200"))
 
-# Best-effort registration-number lookup across the 7 crawlers' differing
+# Best-effort registration-number lookup across the crawlers' differing
 # json_data shapes (checked against each crawler's actual field names):
 #   Brazil (ANVISA):        numeroRegistro
 #   South Africa (SAHPRA):  detail.registration_number, else application_no
@@ -42,8 +42,9 @@ BATCH_SIZE = int(os.getenv("PROMOTE_BATCH_SIZE", "200"))
 #   United Kingdom (MHRA):  not captured yet (dedup is by name only) -> None
 #   Saudi Arabia (SFDA):    registration_number (top-level; SFDA's own registerNumber,
 #                           already the first key checked below)
+#   European Union (EMA):   ema_product_number (e.g. EMEA/H/C/005781)
 _TOP_LEVEL_KEYS = (
-    'registration_number', 'numeroRegistro', 'artg_id', 'acceptance_no',
+    'registration_number', 'ema_product_number', 'numeroRegistro', 'artg_id', 'acceptance_no',
     'application_no', 'application_number', 'reg_number', 'license_number', 'pl_number',
 )
 

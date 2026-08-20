@@ -104,7 +104,7 @@ _probe_in_flight = False
 _call_counts = {SELF_HOSTED: 0, OPENROUTER: 0}
 _token_counts = {
     SELF_HOSTED: {"prompt": 0, "completion": 0},
-    OPENROUTER: {"prompt": 0, "completion": 0, "cost": 0.0},
+    OPENROUTER: {"prompt": 0, "completion": 0, "cost": 0.0, "cached_prompt": 0},
 }
 
 
@@ -216,7 +216,7 @@ def reset_stats():
         for provider in _call_counts:
             _call_counts[provider] = 0
         _token_counts[SELF_HOSTED].update(prompt=0, completion=0)
-        _token_counts[OPENROUTER].update(prompt=0, completion=0, cost=0.0)
+        _token_counts[OPENROUTER].update(prompt=0, completion=0, cost=0.0, cached_prompt=0)
 
 
 def _mark_failure():
@@ -270,6 +270,9 @@ def _mark_success(provider, usage=None):
             cost = getattr(usage, "cost", None)
             if cost is not None and "cost" in bucket:
                 bucket["cost"] += cost
+            cached = _cached_tokens(usage)
+            if cached and "cached_prompt" in bucket:
+                bucket["cached_prompt"] += cached
         if provider == SELF_HOSTED:
             _consecutive_failures = 0
             _probe_in_flight = False
@@ -345,6 +348,49 @@ def discover_context_window():
     return LLM_SERVICE_CONTEXT_TOKENS
 
 
+def _with_cache_control(messages):
+    """
+    OpenRouter only gives a prompt-caching discount on non-OpenAI providers
+    (Anthropic, Google Gemini) when a message content block carries an
+    explicit ``cache_control: {"type": "ephemeral"}`` breakpoint — unlike
+    OpenAI models, where the discount is automatic. Without it, every call's
+    ~4-5k-token SYSTEM_PROMPT (ai_extraction.py) — byte-identical across
+    every excerpt of every product — is billed at full price every time;
+    confirmed empirically (observed OpenRouter cost matched full undiscounted
+    pricing exactly, with no cache line item at all).
+
+    Only applied on the OpenRouter path: a self-hosted vLLM server only
+    understands plain string content and either chokes on or silently drops
+    an unrecognised field, so this must never touch the self-hosted call —
+    hence a new list/dict is returned rather than mutating `messages` in
+    place, since the same object is reused for the self-hosted attempt.
+    """
+    if not messages or messages[0].get("role") != "system":
+        return messages
+    system_content = messages[0].get("content")
+    if not isinstance(system_content, str):
+        return messages  # already structured (or empty) — leave as-is
+    cached_system = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": system_content,
+             "cache_control": {"type": "ephemeral"}},
+        ],
+    }
+    return [cached_system] + messages[1:]
+
+
+def _cached_tokens(usage):
+    """
+    Cached-portion of prompt_tokens, when the provider reports it (OpenAI's
+    usage.prompt_tokens_details.cached_tokens shape, which OpenRouter proxies
+    through for providers that support it). None when absent — distinct from
+    0, so callers can tell "no caching info reported" from "reported zero".
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    return getattr(details, "cached_tokens", None) if details else None
+
+
 def _call_provider(provider, messages, temperature, max_tokens, json_mode, retries):
     """
     Run one provider's retry loop. Returns (text, usage).
@@ -355,6 +401,7 @@ def _call_provider(provider, messages, temperature, max_tokens, json_mode, retri
         client, model = get_llm_service_client(), LLM_SERVICE_MODEL
     else:
         client, model = get_fallback_client(), LLM_FALLBACK_MODEL
+        messages = _with_cache_control(messages)
 
     params = {
         "model": model,

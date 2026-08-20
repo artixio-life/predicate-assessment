@@ -24,6 +24,15 @@ source.drug_predicate_raw_records   (source-predicate)
    -> drug.products.product_data (6-key contract, schema/product_data_spec.md)
 ```
 
+European Union products are the one exception to "chunk the whole
+document": their PDF is Annex I (SmPC) + Annex II (manufacturer/marketing
+conditions) + Annex III (Labelling + Package Leaflet), and Annex I alone can
+run to hundreds of pages of clinical narrative the AI extraction fold
+doesn't need — Annex III is a much shorter, already-summarised version of
+the same core facts. `processing/eu_section_extraction.py` slices out Annex
+III before chunking (falling back to the full document if that section
+isn't found); `document_text` itself always keeps the full extracted text.
+
 Products with no document to OCR (registry-only sources) skip Stage B and
 run Stage C directly off their carried-forward `json_data`. Products that
 *do* have a document still get their `json_data` folded in alongside the

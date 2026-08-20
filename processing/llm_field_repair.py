@@ -26,6 +26,8 @@ extra cost.
 """
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from psycopg2.extras import RealDictCursor
 
@@ -409,12 +411,77 @@ def _persist(cursor, product_id, product_data, indications):
     )
 
 
-def run(country="Australia", limit=None, dry_run=False):
+def _worker(products, cursor_lock, next_index, dry_run, stats, stats_lock):
+    """
+    One worker's loop over the shared `products` list.
+
+    Its own DB connection, because psycopg2 connections are not thread-safe to
+    share — the same reason every other stage in this pipeline opens one per
+    worker (see processing/text_extraction.py, processing/ai_extraction.py).
+
+    Work is taken from a shared index under a lock rather than pre-sharded by
+    `i % n`: per-row LLM latency varies by more than an order of magnitude
+    (a one-line indication versus KEYTRUDA's 8k-character block), so a static
+    split would leave workers idle while one grinds through the long tail.
+    """
+    from db import get_db_connection
+
+    conn = get_db_connection()
+    try:
+        while True:
+            with cursor_lock:
+                if next_index[0] >= len(products):
+                    break
+                product = products[next_index[0]]
+                next_index[0] += 1
+
+            try:
+                repaired, indications, called = repair_product(
+                    product["json_data"], product["product_data"])
+                if not called:
+                    outcome = "skipped"
+                elif dry_run:
+                    print(f"=== product {product['id']} — DRY RUN, not persisted ===")
+                    print(json.dumps({
+                        "presentations": repaired["presentations"],
+                        "indications": indications,
+                    }, indent=2, ensure_ascii=False))
+                    outcome = "dry_run"
+                else:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        _persist(cur, product["id"], repaired, indications)
+                        conn.commit()
+                    outcome = "repaired"
+            except Exception:
+                conn.rollback()
+                logger.exception(f"[llm_field_repair] product={product['id']} errored")
+                outcome = "error"
+
+            with stats_lock:
+                stats[outcome] = stats.get(outcome, 0) + 1
+                done = sum(stats.values())
+            logger.info(
+                f"[llm_field_repair] product={product['id']} -> {outcome} "
+                f"({done}/{len(products)})"
+            )
+    finally:
+        conn.close()
+
+
+def run(country="Australia", limit=None, dry_run=False, workers=1):
     """
     Repairs pack_size/indications on `country`'s TGA rows that meet the
-    selection rule in repair_product's docstring: stored pack_size null AND
-    raw json_data pack_size present. Sequential — an LLM call per row is the
-    slow part and the qualifying set is small.
+    selection rule in repair_product's docstring.
+
+    `workers` runs that many concurrent repair loops. Every call is one
+    independent LLM request against a single row, and each row is written by
+    exactly one worker, so there is no cross-row state to coordinate — unlike
+    the claim-based stages, no row locking is needed here because the work
+    list is fetched once up front and handed out in-process.
+
+    Raise this to shorten a large run; the ceiling is whatever the provider
+    will accept concurrently (OpenRouter rate-limits per key, so a 429 storm
+    is the symptom of setting it too high).
     """
     from db import get_db_connection
     from processing import llm_service_client
@@ -459,33 +526,29 @@ def run(country="Australia", limit=None, dry_run=False):
             products = cur.fetchall()
         conn.commit()
 
-        logger.info(f"[llm_field_repair] {len(products)} qualifying row(s) for {country}")
-        for product in products:
-            try:
-                repaired, indications, called = repair_product(
-                    product["json_data"], product["product_data"])
-                if not called:
-                    outcome = "skipped"
-                elif dry_run:
-                    print(f"=== product {product['id']} — DRY RUN, not persisted ===")
-                    print(json.dumps({
-                        "presentations": repaired["presentations"],
-                        "indications": indications,
-                    }, indent=2, ensure_ascii=False))
-                    outcome = "dry_run"
-                else:
-                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                        _persist(cur, product["id"], repaired, indications)
-                        conn.commit()
-                    outcome = "repaired"
-            except Exception:
-                conn.rollback()
-                logger.exception(f"[llm_field_repair] product={product['id']} errored")
-                outcome = "error"
-            stats[outcome] = stats.get(outcome, 0) + 1
-            logger.info(f"[llm_field_repair] product={product['id']} -> {outcome}")
+        logger.info(
+            f"[llm_field_repair] {len(products)} qualifying row(s) for {country} "
+            f"[{max(1, workers)} worker(s)]"
+        )
     finally:
+        # The fetch connection is done; each worker opens its own.
         conn.close()
+
+    if products:
+        count = max(1, workers)
+        next_index, index_lock = [0], threading.Lock()
+        stats_lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            futures = [
+                pool.submit(_worker, products, index_lock, next_index,
+                            dry_run, stats, stats_lock)
+                for _ in range(count)
+            ]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("[llm_field_repair] worker thread crashed")
 
     logger.info(f"[llm_field_repair] done for {country}: {stats}")
     logger.info(f"[llm_field_repair] LLM usage: {llm_service_client.provider_stats()}")

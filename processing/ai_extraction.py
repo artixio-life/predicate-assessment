@@ -6,14 +6,20 @@ at a time. Each call is shown the JSON accumulated from every prior chunk
 and asked to return the complete, updated object — not a diff — so the
 result after the last chunk is the merged extraction across the whole
 document. The crawler's raw json_data (application details, product
-tables, approval history, therapeutic equivalents, ...) is always folded
-in too, chunked the same way as document text — not only as a
-registry-only fallback when there's no document at all, but as extra
-context alongside document_text whenever both exist (see
-schema/schema.sql's json_data comment). Document prose often doesn't
-restate structured facts like application numbers or approval dates, so
-skipping json_data whenever a document was present used to silently drop
-real signal.
+tables, approval history, therapeutic equivalents, ...) is folded in too,
+chunked the same way as document text — not only as a registry-only
+fallback when there's no document at all, but as extra context alongside
+document_text whenever both exist (see schema/schema.sql's json_data
+comment). Document prose often doesn't restate structured facts like
+application numbers or approval dates, so skipping json_data whenever a
+document was present used to silently drop real signal.
+
+_SKIP_JSON_DATA_WHEN_DOCUMENT below is the one exception: for those
+countries, json_data is dropped once drug.product_chunks actually has rows
+(i.e. a document was chunked) — that crawler's json_data is a thin metadata
+skeleton restating what the document already says, so including both wastes
+chunk budget rather than adding signal. If no chunks exist yet, json_data
+still goes through as the fallback, same as any other country.
 
 Two things get written per product:
 - the flat `columns` on drug.products itself (brand_name, mah_name,
@@ -62,6 +68,9 @@ logger = logging.getLogger(__name__)
 # llm_service_client's LLM_FALLBACK_MODEL defaults to, and is only reached when
 # the self-hosted endpoint is unreachable or keeps erroring.
 EXTRACTOR_MODEL = os.getenv("EXTRACTOR_MODEL", "google/gemini-2.5-flash")
+
+# See module docstring. Keyed by drug.regulatory_geography.country_name.
+_SKIP_JSON_DATA_WHEN_DOCUMENT = {"European Union"}
 
 # Cap on the reply. The fold re-emits the WHOLE accumulated object every call, so
 # this must cover the largest accumulated object, not the largest excerpt.
@@ -660,11 +669,15 @@ def _input_units(cursor, product):
     )
     document_chunks = [row["chunk_text"] for row in cursor.fetchall()]
 
+    if document_chunks and product.get("country_name") in _SKIP_JSON_DATA_WHEN_DOCUMENT:
+        return document_chunks
+
     # json_data goes first: it's the structured "skeleton" (application
     # number, product table, approval dates, TE cross-references) that
     # document prose often doesn't restate, so the fold sees it before the
     # narrative detail in document_chunks. Included whenever present, not
-    # only when document_chunks is empty — see module docstring.
+    # only when document_chunks is empty — see module docstring and
+    # _SKIP_JSON_DATA_WHEN_DOCUMENT above for the one exception.
     return _json_data_units(product) + document_chunks
 
 
