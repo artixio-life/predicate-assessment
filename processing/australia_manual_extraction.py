@@ -131,26 +131,50 @@ def infer_modality(bases, artg_category):
     return None
 
 
-def _parse_pack_size(raw):
+# Countable dosage-unit nouns TGA's pack_size field uses when it names one —
+# deliberately NOT including volume/weight units (mL, L, g, mg): a bare
+# '600 mL' or '50 g' chunk describes a container's FILL SIZE, not a count of
+# units, and must never be mistaken for one.
+_PACK_UNIT_WORDS = (
+    "tablet", "capsule", "sachet", "ampoule", "amp", "vial", "syringe",
+    "bottle", "dose", "patch", "pen",
+)
+_PACK_CHUNK_RE = re.compile(
+    r"^(?:pack\s+of\s+)?(?P<count>\d+)\s*(?:'|’)?(?:(?P<unit>"
+    + "|".join(_PACK_UNIT_WORDS) + r")s?)?(?:\s+pack)?$",
+    re.I,
+)
+
+
+def _parse_pack_chunks(raw):
     """
-    Usually a single integer ('56'). Sometimes a comma-separated LIST of
-    alternative pack configurations sold under the one ARTG entry (e.g.
-    '28 x 4g sachets, 8 sachets, 16 sachets, ...') — enumerating that into
-    distinct presentations would mean parsing free-form pack descriptions
-    ("28 x 4g" vs "8 sachets" aren't even the same kind of quantity), which
-    risks inventing a pack count that isn't cleanly stated. Left null in that
-    case rather than guessed; the raw text isn't a value this schema's
-    numeric pack_size field can honestly represent anyway.
+    Returns one (pack_size, pack_unit) per cleanly-parsed chunk of a
+    comma-separated pack_size string — e.g. '14 tablets, 56 tablets' ->
+    [(14,'tablet'), (56,'tablet')], '56s' -> [(56, None)] (TGA's own 'Xs'
+    shorthand for a bare pack count).
+
+    Deliberately does NOT attempt anything containing 'x' (e.g. '2mL x 2',
+    '5 x 20 mL ampoules'): checked across this whole corpus, that shape's
+    ordering is NOT consistent — some records write volume-then-count, others
+    count-then-volume, for the same kind of product. Guessing an order would
+    silently swap the pack count and the fill volume on some fraction of
+    records, which is worse than reporting nothing. Kit/bundle descriptions
+    ('1 kit containing...'), bare volume/weight ('500 mL', '50 g'), and prose
+    ('Each pack contains 1 vial.') also don't match and are correctly
+    skipped — none of these are a plain, unambiguous unit count.
     """
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
+    if not raw:
+        return []
+    out = []
+    for chunk in str(raw).split(","):
+        chunk = re.sub(r"\s*\([^)]*\)\s*$", "", chunk).strip()
+        if not chunk or "x" in chunk.lower():
+            continue
+        m = _PACK_CHUNK_RE.match(chunk)
+        if not m:
+            continue
+        out.append((int(m.group("count")), (m.group("unit") or "").lower() or None))
+    return out
 
 
 def _to_iso_date(value):
@@ -161,7 +185,14 @@ def _to_iso_date(value):
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
 
 
-def build_presentation(component):
+def build_presentations(component):
+    """
+    One or more presentations for this component — more than one when
+    pack_size names several distinct, cleanly-parsed pack configurations
+    (see _parse_pack_chunks). All share the same form/route/active_ingredients
+    and differ only in pack_size/pack_unit, since that's the only thing the
+    source states multiple values for.
+    """
     names_raw = _split_top_level(component.get("active_ingredients") or "")
     ingredients = []
     for chunk in names_raw:
@@ -175,26 +206,35 @@ def build_presentation(component):
                      if salt_form else None),
         })
 
-    pack_size = _parse_pack_size(component.get("pack_size"))
     form = _clean(component.get("dosage_form"))
     route = _clean(component.get("route_of_administration"))
-
-    return {
+    base_fields = {
         # TGA's ARTG summary states total ingredient content per dosage unit
         # (a capsule, a sachet), not a per-volume concentration — there is no
         # per-mL/per-dose denominator field in this shape the way an
         # injectable's would carry one.
         "per_value": None,
         "per_unit": None,
-        "pack_size": pack_size,
-        # pack_size's own text often names the unit ('sachets') redundantly;
-        # when pack_size couldn't be parsed as a plain number, pack_unit has
-        # nothing reliable to pair it with either.
-        "pack_unit": None,
         "form": form.lower() if form else None,
         "route": route.lower() if route else None,
         "active_ingredients": ingredients,
     }
+
+    pack_chunks = _parse_pack_chunks(component.get("pack_size"))
+    if not pack_chunks:
+        # Nothing parsed cleanly (an 'x'-shaped, kit, or prose description —
+        # see _parse_pack_chunks) — one presentation, pack fields left null
+        # rather than guessed.
+        return [{**base_fields, "pack_size": None, "pack_unit": None}]
+
+    seen, out = set(), []
+    for pack_size, pack_unit in pack_chunks:
+        key = (pack_size, pack_unit)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({**base_fields, "pack_size": pack_size, "pack_unit": pack_unit})
+    return out
 
 
 def _indications_from(component):
@@ -329,7 +369,7 @@ def extract(json_data, document_text=None):
     _require_tga_shape(json_data)
 
     components = [c for c in (json_data.get("components") or []) if isinstance(c, dict)]
-    presentations = [build_presentation(c) for c in components]
+    presentations = [p for c in components for p in build_presentations(c)]
     indications = []
     for c in components:
         for ind in _indications_from(c):

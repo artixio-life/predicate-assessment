@@ -401,7 +401,7 @@ def _call_provider(provider, messages, temperature, max_tokens, json_mode, retri
     raise LLMServiceError(f"{provider} failed after {retries} attempts: {last_error}")
 
 
-def call_chat(messages, temperature=0.0, max_tokens=512, json_mode=False):
+def call_chat(messages, temperature=0.0, max_tokens=512, json_mode=False, provider=None):
     """
     Call the LLM and return (text, provider, meta).
 
@@ -413,7 +413,25 @@ def call_chat(messages, temperature=0.0, max_tokens=512, json_mode=False):
     payload to a different provider does not make it fit, and (unlike a dead
     endpoint) it says nothing about the self-hosted service's health. It
     propagates so the caller can split the payload instead.
+
+    `provider` pins one provider for this call instead of using the normal
+    self-hosted-then-fallback selection — pass OPENROUTER when a job must run
+    on the hosted API regardless of whether a self-hosted endpoint happens to
+    be configured (see processing/llm_field_repair.py). Unlike force_fallback(),
+    this changes nothing globally and arms no recovery timer, so it cannot
+    drift back to the other provider partway through a run.
     """
+    if provider == OPENROUTER:
+        if not fallback_available():
+            raise LLMServiceError(
+                "provider=openrouter was requested but the OpenRouter fallback is "
+                "unavailable (OPEN_ROUTER_API_KEY unset or LLM_SERVICE_FALLBACK=false)"
+            )
+        text, usage, finish_reason = _call_provider(
+            OPENROUTER, messages, temperature, max_tokens, json_mode, LLM_SERVICE_RETRIES)
+        _mark_success(OPENROUTER, usage)
+        return text, OPENROUTER, {"usage": usage, "finish_reason": finish_reason}
+
     provider = current_provider()
 
     if provider == SELF_HOSTED:
@@ -439,7 +457,7 @@ def call_chat(messages, temperature=0.0, max_tokens=512, json_mode=False):
 
 
 def call_json(system, user, max_tokens=512, temperature=0.0, json_mode=True,
-              parse_retries=1):
+              parse_retries=1, provider=None):
     """
     Call the model and parse the reply as a JSON object, using the pipeline's
     own sanitize -> parse -> repair cascade (processing/json_utils.py).
@@ -448,27 +466,30 @@ def call_json(system, user, max_tokens=512, temperature=0.0, json_mode=True,
     `finish_reason`, and `repaired` (True when the cascade had to fix the
     output — worth reporting, since a model needing frequent repair is a
     warning sign even when every call technically parses).
+
+    `provider` pins one provider for these calls — see call_chat.
     """
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    last_meta, last_provider = {}, current_provider()
+    last_meta, last_provider = {}, provider or current_provider()
     for attempt in range(parse_retries + 1):
-        raw, provider, meta = call_chat(
-            messages, temperature=temperature, max_tokens=max_tokens, json_mode=json_mode)
-        last_provider, last_meta = provider, meta
+        raw, provider_used, meta = call_chat(
+            messages, temperature=temperature, max_tokens=max_tokens,
+            json_mode=json_mode, provider=provider)
+        last_provider, last_meta = provider_used, meta
         if raw:
             try:
                 obj = __import__("json").loads(raw)
                 meta["repaired"] = False
-                return obj, provider, meta
+                return obj, provider_used, meta
             except ValueError:
                 pass
             try:
                 obj = parse_llm_json(raw)
                 meta["repaired"] = True
-                return obj, provider, meta
+                return obj, provider_used, meta
             except JsonParseError:
                 pass
         if attempt < parse_retries:
