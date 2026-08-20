@@ -11,7 +11,8 @@ already in drug.products.
 """
 import logging
 
-from processing import promote, text_extraction, ai_extraction
+from processing import ai_extraction, manual_extraction_runner, promote, text_extraction
+from processing.manual_extractors import MANUAL_EXTRACTORS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -73,5 +74,14 @@ def run(limit=None, country=None, workers=1, stages=ALL_STAGES):
         text_extraction.extract_pending(limit=limit, country=country, workers=workers)
 
     if "ai" in stages:
-        logger.info(f"=== Stage C: AI extraction ==={scope} [{workers} worker(s)]")
-        ai_extraction.extract_pending(limit=limit, country=country, workers=workers)
+        manual_extract_fn = MANUAL_EXTRACTORS.get(country)
+        if manual_extract_fn:
+            logger.info(
+                f"=== Stage C: manual (no-LLM) extraction ==={scope} [{workers} worker(s)] "
+                f"— {country} has a deterministic mapper (processing/manual_extractors.py), "
+                f"skipping the LLM entirely"
+            )
+            manual_extraction_runner.run(country, manual_extract_fn, limit=limit, workers=workers)
+        else:
+            logger.info(f"=== Stage C: AI extraction ==={scope} [{workers} worker(s)]")
+            ai_extraction.extract_pending(limit=limit, country=country, workers=workers)

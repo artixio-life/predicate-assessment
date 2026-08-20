@@ -49,6 +49,7 @@ from psycopg2.extras import Json, RealDictCursor
 from db import get_db_connection
 from processing.chunking import DEFAULT_TARGET_TOKENS, count_tokens
 from processing.claim import claim_ai_extraction, count_ai_extraction_pending
+from processing.manual_extractors import MANUAL_EXTRACTORS
 from processing import llm_service_client
 from processing.progress import Progress
 from processing.retry import run_with_retries, RetriesExhausted
@@ -935,7 +936,8 @@ def _worker(country, remaining, remaining_lock, progress):
                     if remaining[0] <= 0:
                         break
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                product = claim_ai_extraction(cur, country=country)
+                product = claim_ai_extraction(
+                    cur, country=country, exclude_countries=MANUAL_EXTRACTORS.keys())
                 conn.commit()
             if not product:
                 break
@@ -1014,10 +1016,26 @@ def extract_pending(limit=None, country=None, workers=1):
         f"{MAX_CHUNKS_PER_PRODUCT or 'none'}"
     )
 
+    if country in MANUAL_EXTRACTORS:
+        # Structurally refuse rather than silently spend on OpenRouter: this
+        # country has a deterministic mapper (processing/manual_extractors.py)
+        # and must go through processing/manual_extraction_runner.py instead —
+        # see processing/runner.py, which is supposed to route it there before
+        # ever reaching this function. If you landed here anyway (calling this
+        # directly, bypassing runner.py), that routing was skipped — fix the
+        # caller rather than removing this check.
+        logger.warning(
+            f"[ai_extraction] {country!r} has a registered manual extractor "
+            f"(processing/manual_extractors.MANUAL_EXTRACTORS) — refusing to run "
+            f"the LLM path on it. Use processing.manual_extraction_runner instead."
+        )
+        return {}
+
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            pending = count_ai_extraction_pending(cur, country=country)
+            pending = count_ai_extraction_pending(
+                cur, country=country, exclude_countries=MANUAL_EXTRACTORS.keys())
         conn.commit()
     finally:
         conn.close()

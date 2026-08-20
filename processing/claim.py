@@ -71,13 +71,25 @@ def count_text_extraction_pending(cursor, country=None):
     return cursor.fetchone()["n"]
 
 
-def count_ai_extraction_pending(cursor, country=None):
-    """See count_text_extraction_pending — same idea for Stage C."""
+def count_ai_extraction_pending(cursor, country=None, exclude_countries=None):
+    """See count_text_extraction_pending — same idea for Stage C.
+
+    `exclude_countries` is how ai_extraction.py guarantees it never counts (and
+    therefore never claims — see claim_ai_extraction) a country that has its
+    own deterministic mapper registered in processing/manual_extractors.py,
+    regardless of how this run is scoped. Without it, an unscoped ai_extraction
+    run (no `country` given) would still see that country's PENDING rows and
+    send them to the LLM.
+    """
     params = []
     country_clause = ""
     if country:
         country_clause = " AND g.country_name = %s"
         params.append(country)
+    exclude_clause = ""
+    if exclude_countries:
+        exclude_clause = " AND (g.country_name IS NULL OR g.country_name <> ALL(%s))"
+        params.append(list(exclude_countries))
     cursor.execute(
         f"""
         SELECT COUNT(*) AS n
@@ -86,19 +98,24 @@ def count_ai_extraction_pending(cursor, country=None):
         WHERE p.processing_status = 'PARSED'
           AND (p.ai_extraction_status = 'PENDING'
                OR (p.ai_extraction_status = 'PROCESSING'
-                   AND p.updated_at < CURRENT_TIMESTAMP - INTERVAL '{STALE_MINUTES} minutes')){country_clause}
+                   AND p.updated_at < CURRENT_TIMESTAMP - INTERVAL '{STALE_MINUTES} minutes')){country_clause}{exclude_clause}
         """,
         tuple(params),
     )
     return cursor.fetchone()["n"]
 
 
-def claim_ai_extraction(cursor, country=None):
+def claim_ai_extraction(cursor, country=None, exclude_countries=None):
+    """See count_ai_extraction_pending for what `exclude_countries` is for."""
     params = []
     country_clause = ""
     if country:
         country_clause = " AND g.country_name = %s"
         params.append(country)
+    exclude_clause = ""
+    if exclude_countries:
+        exclude_clause = " AND (g.country_name IS NULL OR g.country_name <> ALL(%s))"
+        params.append(list(exclude_countries))
     cursor.execute(
         f"""
         UPDATE drug.products AS p
@@ -110,7 +127,7 @@ def claim_ai_extraction(cursor, country=None):
             WHERE p2.processing_status = 'PARSED'
               AND (p2.ai_extraction_status = 'PENDING'
                    OR (p2.ai_extraction_status = 'PROCESSING'
-                       AND p2.updated_at < CURRENT_TIMESTAMP - INTERVAL '{STALE_MINUTES} minutes')){country_clause}
+                       AND p2.updated_at < CURRENT_TIMESTAMP - INTERVAL '{STALE_MINUTES} minutes')){country_clause}{exclude_clause}
             ORDER BY p2.created_at
             FOR UPDATE OF p2 SKIP LOCKED
             LIMIT 1
