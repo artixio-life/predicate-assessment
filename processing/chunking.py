@@ -10,8 +10,16 @@ overlap keeps continuity across the cut.
 import re
 from typing import List
 
-DEFAULT_TARGET_TOKENS = 1800
-DEFAULT_OVERLAP_RATIO = 0.15
+import os
+
+# Chunk size in tokens. Lowering it makes each excerpt smaller, which is the
+# lever for a small-context model: the fold's per-call prompt is the system
+# prompt + accumulator + CHUNKS_PER_CALL excerpts, so halving this roughly
+# halves the excerpt half of that budget.
+DEFAULT_TARGET_TOKENS = int(os.getenv("CHUNK_TARGET_TOKENS", "1800"))
+# Fraction of the previous chunk prefixed onto each chunk, so a fact split
+# across a boundary is still readable in one of them.
+DEFAULT_OVERLAP_RATIO = float(os.getenv("CHUNK_OVERLAP_RATIO", "0.15"))
 
 try:
     import tiktoken

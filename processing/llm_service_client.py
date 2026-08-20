@@ -43,6 +43,17 @@ from processing.json_utils import parse_llm_json, JsonParseError
 
 logger = logging.getLogger(__name__)
 
+# Master switch for the self-hosted path. 'false' sends every call straight to
+# OpenRouter without ever probing the GPU — distinct from a FAILURE to reach it,
+# so a deliberately hosted-only run is not reported as "degraded" and does not
+# emit the paid-API warning on every summary.
+#
+# Combined with LLM_SERVICE_FALLBACK:
+#   ENABLED=true  FALLBACK=true   self-hosted first, temporary fallback (default)
+#   ENABLED=true  FALLBACK=false  self-hosted only; failures are fatal
+#   ENABLED=false      (either)   OpenRouter only
+LLM_SERVICE_ENABLED = os.getenv("LLM_SERVICE_ENABLED", "true").lower() != "false"
+
 LLM_SERVICE_BASE_URL = (os.getenv("LLM_SERVICE_BASE_URL", "") or "").rstrip("/")
 LLM_SERVICE_API_KEY = os.getenv("LLM_SERVICE_API_KEY", "") or ""
 LLM_SERVICE_MODEL = os.getenv("LLM_SERVICE_MODEL", "gemma-4-26b")
@@ -106,6 +117,11 @@ def get_llm_service_client():
     if _client is None:
         with _client_lock:
             if _client is None:
+                if not LLM_SERVICE_ENABLED:
+                    raise LLMServiceError(
+                        "LLM_SERVICE_ENABLED=false — the self-hosted path is "
+                        "switched off; calls go to OpenRouter."
+                    )
                 if not LLM_SERVICE_BASE_URL:
                     raise LLMServiceError(
                         "LLM_SERVICE_BASE_URL is not set — cannot reach the "
@@ -130,10 +146,25 @@ def get_fallback_client():
     return openrouter_client()
 
 
+def self_hosted_available():
+    """True when the self-hosted path is both switched on and configured."""
+    return bool(LLM_SERVICE_ENABLED and LLM_SERVICE_BASE_URL)
+
+
 def fallback_available():
-    if not LLM_FALLBACK_ENABLED:
+    """
+    True when OpenRouter can serve a call.
+
+    LLM_SERVICE_FALLBACK gates falling back FROM self-hosted, so it only applies
+    while the self-hosted path is actually in use. With LLM_SERVICE_ENABLED=false
+    OpenRouter is the configured provider rather than a fallback, and a leftover
+    LLM_SERVICE_FALLBACK=false must not disable the only provider left.
+    """
+    if not os.getenv("OPEN_ROUTER_API_KEY"):
         return False
-    return bool(os.getenv("OPEN_ROUTER_API_KEY"))
+    if not self_hosted_available():
+        return True
+    return LLM_FALLBACK_ENABLED
 
 
 def current_provider():
@@ -146,7 +177,7 @@ def current_provider():
     finishing on the paid API.
     """
     global _probe_in_flight
-    if not LLM_SERVICE_BASE_URL:
+    if not self_hosted_available():
         return OPENROUTER
     with _provider_lock:
         if not _degraded:
@@ -296,7 +327,7 @@ def discover_context_window():
     ``max_model_len``), falling back to LLM_SERVICE_CONTEXT_TOKENS when the
     server does not report one. vLLM exposes it; most others do not.
     """
-    if not LLM_SERVICE_BASE_URL:
+    if not self_hosted_available():
         return LLM_SERVICE_CONTEXT_TOKENS
     try:
         for model in get_llm_service_client().models.list().data:
@@ -457,13 +488,27 @@ def health_check():
     it is unreachable, switches the run to the OpenRouter fallback and probes
     that instead. Raises LLMServiceError only when neither can serve traffic.
     """
-    if not LLM_SERVICE_BASE_URL:
+    if not self_hosted_available():
+        reason = ("LLM_SERVICE_ENABLED=false" if not LLM_SERVICE_ENABLED
+                  else "LLM_SERVICE_BASE_URL is not set")
         if not fallback_available():
             raise LLMServiceError(
-                "LLM_SERVICE_BASE_URL is not set and no OpenRouter fallback is "
-                "available (set OPEN_ROUTER_API_KEY or LLM_SERVICE_BASE_URL)."
+                f"{reason} and no OpenRouter fallback is available — no provider "
+                f"can serve this run. Set OPEN_ROUTER_API_KEY, or enable the "
+                f"self-hosted path (LLM_SERVICE_ENABLED=true + "
+                f"LLM_SERVICE_BASE_URL)."
             )
-        force_fallback("LLM_SERVICE_BASE_URL is not set")
+        if not LLM_SERVICE_ENABLED:
+            # Deliberate: OpenRouter is the configured provider, not a fallback.
+            # Do NOT mark the run degraded — that flag means "we wanted the GPU
+            # and could not have it", which would misreport an intended setup.
+            logger.info(
+                f"[llm_service] self-hosted path disabled "
+                f"(LLM_SERVICE_ENABLED=false) — using {LLM_FALLBACK_MODEL} "
+                f"via OpenRouter as the configured provider"
+            )
+        else:
+            force_fallback(reason)
         return _probe_fallback()
 
     try:

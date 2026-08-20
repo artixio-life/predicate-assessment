@@ -111,6 +111,16 @@ MIN_COMPLETION_TOKENS = int(os.getenv("AI_EXTRACTION_MIN_COMPLETION", "512"))
 # most splits; raise it when pointing this stage back at a large-context model.
 CHUNKS_PER_CALL = int(os.getenv("AI_EXTRACTION_CHUNKS_PER_CALL", "5"))
 
+# Hard cap on how many excerpts a single product may send, across all its calls.
+# 0 (the default) means no cap.
+#
+# This is a COST/TIME control, not a quality one: the tail of a long product is
+# genuinely dropped, so anything only stated in excerpt 21 of 51 is lost. A
+# capped row therefore lands NEEDS_REVIEW rather than DONE even when every call
+# succeeded — it has not actually been fully read, and marking it ENRICHED would
+# assert something untrue about the data.
+MAX_CHUNKS_PER_PRODUCT = int(os.getenv("AI_EXTRACTION_MAX_CHUNKS", "0"))
+
 
 def _batch(items, size):
     return [items[i:i + size] for i in range(0, len(items), size)]
@@ -843,6 +853,17 @@ def _extract_one(cursor, product):
         )
         return "skipped"
 
+    capped_from = None
+    if MAX_CHUNKS_PER_PRODUCT and len(units) > MAX_CHUNKS_PER_PRODUCT:
+        capped_from = len(units)
+        logger.warning(
+            f"[ai_extraction] product={product['id']}: capping {capped_from} excerpts "
+            f"to {MAX_CHUNKS_PER_PRODUCT} (AI_EXTRACTION_MAX_CHUNKS) — excerpts "
+            f"{MAX_CHUNKS_PER_PRODUCT + 1}-{capped_from} will NOT be read, so this "
+            f"row lands NEEDS_REVIEW rather than DONE"
+        )
+        units = units[:MAX_CHUNKS_PER_PRODUCT]
+
     accumulated = {"columns": {}, "product_data": {}}
     failed_chunks = []
     total = len(units)
@@ -859,6 +880,13 @@ def _extract_one(cursor, product):
     product_data = accumulated.get("product_data") or {}
     has_all_keys = all(key in product_data for key in PRODUCT_DATA_KEYS)
     attempts = len(failed_chunks)
+    if capped_from:
+        # Recorded like a failed batch so the reason survives in
+        # ai_extraction_error and the status logic below cannot return DONE.
+        failed_chunks.append((
+            f"{MAX_CHUNKS_PER_PRODUCT + 1}-{capped_from}",
+            f"not sent: AI_EXTRACTION_MAX_CHUNKS={MAX_CHUNKS_PER_PRODUCT}",
+        ))
 
     if not product_data and not accumulated.get("columns"):
         ai_status, processing_status = "FAILED", "FAILED"
@@ -961,11 +989,29 @@ def extract_pending(limit=None, country=None, workers=1):
     # row to PROCESSING, fail it, and burn the whole queue's retry budget before
     # anyone noticed the GPU was down.
     llm_service_client.health_check()
+    if llm_service_client.self_hosted_available():
+        logger.info(
+            f"[ai_extraction] primary: {llm_service_client.LLM_SERVICE_MODEL} @ "
+            f"{llm_service_client.LLM_SERVICE_BASE_URL} | fallback: "
+            f"{llm_service_client.LLM_FALLBACK_MODEL} "
+            f"({'enabled' if llm_service_client.fallback_available() else 'unavailable'})"
+        )
+    else:
+        # Say WHICH of the two reasons, so an accidentally-missing env var is not
+        # mistaken for a deliberate hosted-only run.
+        reason = ("LLM_SERVICE_ENABLED=false"
+                  if not llm_service_client.LLM_SERVICE_ENABLED
+                  else "LLM_SERVICE_BASE_URL is unset")
+        logger.warning(
+            f"[ai_extraction] self-hosted path OFF ({reason}) — every call goes "
+            f"to {llm_service_client.LLM_FALLBACK_MODEL} via OpenRouter (PAID)"
+        )
+
     logger.info(
-        f"[ai_extraction] primary: {llm_service_client.LLM_SERVICE_MODEL} @ "
-        f"{llm_service_client.LLM_SERVICE_BASE_URL or '(unset)'} | "
-        f"fallback: {llm_service_client.LLM_FALLBACK_MODEL} "
-        f"({'enabled' if llm_service_client.fallback_available() else 'unavailable'})"
+        f"[ai_extraction] batching: {CHUNKS_PER_CALL} excerpts/call, "
+        f"max_tokens {MAX_COMPLETION_TOKENS}, chunk size "
+        f"{DEFAULT_TARGET_TOKENS} tokens, per-product excerpt cap "
+        f"{MAX_CHUNKS_PER_PRODUCT or 'none'}"
     )
 
     conn = get_db_connection()
@@ -993,16 +1039,19 @@ def extract_pending(limit=None, country=None, workers=1):
         f"call(s), OpenRouter={calls.get('openrouter', 0)} call(s)"
     )
     if calls.get("openrouter"):
-        # The fallback is a paid API. A run that quietly finished on it looks
-        # identical in the row statuses, so it is called out explicitly here.
+        # OpenRouter is a paid API either way, but distinguish "we chose this"
+        # from "we wanted the GPU and could not have it" — the row statuses look
+        # identical, so only this line tells them apart.
         openrouter = provider_stats["tokens"]["openrouter"]
         cost = openrouter.get("cost") or 0.0
+        role = ("configured provider" if not llm_service_client.self_hosted_available()
+                else "fallback")
         logger.warning(
             f"[ai_extraction] {calls['openrouter']} call(s) went to the PAID OpenRouter "
-            f"fallback ({llm_service_client.LLM_FALLBACK_MODEL}): "
+            f"{role} ({llm_service_client.LLM_FALLBACK_MODEL}): "
             f"{openrouter['prompt']} prompt + {openrouter['completion']} completion tokens"
             + (f", ${cost:.4f}" if cost else "")
-            + (" — the self-hosted endpoint was degraded for this run"
+            + (" — the self-hosted endpoint was unreachable for part of this run"
                if provider_stats["degraded"] else "")
         )
     self_hosted = provider_stats["tokens"]["self_hosted"]

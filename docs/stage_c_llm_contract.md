@@ -322,8 +322,23 @@ OpenRouter. Two behaviours are worth knowing before you read any numbers:
   nothing about the service's health. Such a batch is *split* instead, and the
   failure does not count toward the degradation counter.
 
+Two switches control the routing:
+
+| `LLM_SERVICE_ENABLED` | `LLM_SERVICE_FALLBACK` | behaviour |
+| --- | --- | --- |
+| `true` (default) | `true` (default) | self-hosted first, temporary fallback on failure |
+| `true` | `false` | self-hosted only; failures are fatal (rows land `NEEDS_REVIEW`) |
+| `false` | *ignored* | OpenRouter only, no GPU probe |
+
+`LLM_SERVICE_ENABLED=false` is the clean way to run hosted-only: it reports
+OpenRouter as the *configured provider* rather than flagging the run as degraded,
+so an intentional setup is not confused with a broken GPU in the logs.
 `LLM_SERVICE_FALLBACK=false` makes self-hosted failures fatal — use it when you
 want the benchmark to measure only the local model.
+
+Note `LLM_SERVICE_FALLBACK` gates falling back *from* self-hosted, so it is
+ignored when the self-hosted path is switched off — otherwise a leftover `false`
+would disable the only remaining provider.
 
 ### Context-aware batch splitting
 
