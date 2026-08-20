@@ -453,9 +453,12 @@ def _record_usage(usage, product_id, batch_label):
     completion_tokens = getattr(usage, "completion_tokens", None) or 0
     cost = getattr(usage, "cost", None)
     cost_str = f"${cost:.6f}" if cost is not None else "n/a"
+    cached = llm_service_client._cached_tokens(usage)
+    cached_str = f" cached_tokens={cached}" if cached is not None else ""
     logger.info(
         f"[ai_extraction] usage product={product_id} {batch_label}: "
-        f"prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} cost={cost_str}"
+        f"prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+        f"cost={cost_str}{cached_str}"
     )
     with _usage_lock:
         _usage_totals["calls"] += 1
@@ -1075,12 +1078,15 @@ def extract_pending(limit=None, country=None, workers=1):
         # identical, so only this line tells them apart.
         openrouter = provider_stats["tokens"]["openrouter"]
         cost = openrouter.get("cost") or 0.0
+        cached = openrouter.get("cached_prompt") or 0
         role = ("configured provider" if not llm_service_client.self_hosted_available()
                 else "fallback")
         logger.warning(
             f"[ai_extraction] {calls['openrouter']} call(s) went to the PAID OpenRouter "
             f"{role} ({llm_service_client.LLM_FALLBACK_MODEL}): "
             f"{openrouter['prompt']} prompt + {openrouter['completion']} completion tokens"
+            + (f" ({cached} cached)" if cached else " (0 cached — system-prompt caching "
+               "is not landing; see llm_service_client._with_cache_control)")
             + (f", ${cost:.4f}" if cost else "")
             + (" — the self-hosted endpoint was unreachable for part of this run"
                if provider_stats["degraded"] else "")
