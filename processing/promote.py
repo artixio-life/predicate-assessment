@@ -47,6 +47,18 @@ BATCH_SIZE = int(os.getenv("PROMOTE_BATCH_SIZE", "200"))
 #   Saudi Arabia (SFDA):    registration_number (top-level; SFDA's own registerNumber,
 #                           already the first key checked below)
 #   European Union (EMA):   ema_product_number (e.g. EMEA/H/C/005781)
+#   Thailand (FDA portal):  registration_number (top-level; the official Marketing
+#                           Authorization Number, e.g. "1A 300/33" — set by
+#                           crawler_th_1.py from the portal's REGISTER_LICENSE field,
+#                           deliberately NOT the raw RGTNO numeric component alone,
+#                           which is not guaranteed unique without its RGTTPCD prefix).
+#                           NOTE: this crawler's OWN duplicate check against its raw
+#                           table (source.drug_predicate_raw_records) uses a
+#                           DIFFERENT key, json_data.newcode — the portal's opaque
+#                           internal id (e.g. "U1DR1A1022330030011C"). That key is not
+#                           in _TOP_LEVEL_KEYS on purpose: it identifies a crawled raw
+#                           record, not the drug's real-world registration, so it is
+#                           the wrong value for drug.products.registration_number.
 _TOP_LEVEL_KEYS = (
     'registration_number', 'ema_product_number', 'numeroRegistro', 'artg_id', 'acceptance_no',
     'application_no', 'application_number', 'reg_number', 'license_number', 'pl_number',
