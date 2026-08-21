@@ -213,3 +213,16 @@ CREATE TABLE IF NOT EXISTS drug.product_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_product_chunks_product ON drug.product_chunks(product_id);
+
+-- Which source document a chunk came from. Needed once a product can be
+-- chunked from MORE THAN ONE document: UK/MHRA records carry an SPC plus one
+-- or more PILs (patient leaflets) in json_data.documents[], and the pipeline
+-- now chunks a PIL alongside the primary document (see
+-- processing/text_extraction.py). Without these, chunks from two different
+-- documents are indistinguishable once stored.
+--
+-- Nullable and added via ALTER so this is backward-compatible: rows written
+-- before this change keep NULL, and other repos reading drug.product_chunks
+-- are unaffected by the extra columns.
+ALTER TABLE drug.product_chunks ADD COLUMN IF NOT EXISTS doc_type    TEXT;
+ALTER TABLE drug.product_chunks ADD COLUMN IF NOT EXISTS source_path TEXT;

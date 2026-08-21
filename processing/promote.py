@@ -39,7 +39,11 @@ BATCH_SIZE = int(os.getenv("PROMOTE_BATCH_SIZE", "200"))
 #   Australia (TGA):        artg_id
 #   China (NMPA):           acceptance_no
 #   United States (FDA):    application_number (the ApplNo, e.g. "020892")
-#   United Kingdom (MHRA):  not captured yet (dedup is by name only) -> None
+#   United Kingdom (MHRA):  registration_number (top-level; the PL/PLGB/PLNI/PLPI
+#                           licence number, e.g. "00101/1041" — set by
+#                           crawler_uk_1.py's grouping fix and its backfill
+#                           script, same top-level key as SFDA below, so no
+#                           UK-specific lookup needed here)
 #   Saudi Arabia (SFDA):    registration_number (top-level; SFDA's own registerNumber,
 #                           already the first key checked below)
 #   European Union (EMA):   ema_product_number (e.g. EMEA/H/C/005781)
