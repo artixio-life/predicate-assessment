@@ -133,7 +133,7 @@ def claim_ai_extraction(cursor, country=None, exclude_countries=None):
             FOR UPDATE OF p2 SKIP LOCKED
             LIMIT 1
         )
-        RETURNING p.id, p.product_name, p.registration_number, p.json_data,
+        RETURNING p.id, p.product_name, p.registration_number, p.json_data, p.source_url,
             (SELECT country_name FROM drug.regulatory_geography WHERE id = p.country_id) AS country_name
         """,
         tuple(params),

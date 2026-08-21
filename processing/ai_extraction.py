@@ -16,10 +16,15 @@ document was present used to silently drop real signal.
 
 _SKIP_JSON_DATA_WHEN_DOCUMENT below is the one exception: for those
 countries, json_data is dropped once drug.product_chunks actually has rows
-(i.e. a document was chunked) — that crawler's json_data is a thin metadata
-skeleton restating what the document already says, so including both wastes
-chunk budget rather than adding signal. If no chunks exist yet, json_data
-still goes through as the fallback, same as any other country.
+(i.e. a document was chunked) AND that specific document is confirmed to be
+the expected type (_EXPECTED_DOCUMENT_TYPE) — that crawler's json_data is a
+thin metadata skeleton restating what the EXPECTED document already says, so
+including both wastes chunk budget rather than adding signal. If no chunks
+exist yet, or the chunked document is something else (a different document
+type, or one json_data doesn't even list — see _primary_document_type),
+json_data still goes through, same as any other country: the "it's just a
+redundant skeleton" reasoning only holds for the document it was checked
+against.
 
 Two things get written per product:
 - the flat `columns` on drug.products itself (brand_name, mah_name,
@@ -70,7 +75,16 @@ logger = logging.getLogger(__name__)
 EXTRACTOR_MODEL = os.getenv("EXTRACTOR_MODEL", "google/gemini-2.5-flash")
 
 # See module docstring. Keyed by drug.regulatory_geography.country_name.
+# Skipping json_data for these countries is conditional, not automatic — see
+# _primary_document_type and its call site in _input_units: the reasoning
+# ("json_data is a redundant metadata skeleton") only holds when the chunked
+# document actually IS the type that reasoning was based on. A different
+# document (an assessment report, a variation notice, an older template
+# extract_annex_iii doesn't recognise — see processing/eu_section_extraction.py)
+# is not guaranteed to restate the same facts, so json_data is included for
+# those rather than assumed redundant.
 _SKIP_JSON_DATA_WHEN_DOCUMENT = {"European Union"}
+_EXPECTED_DOCUMENT_TYPE = {"European Union": "product_information"}
 
 # Cap on the reply. The fold re-emits the WHOLE accumulated object every call, so
 # this must cover the largest accumulated object, not the largest excerpt.
@@ -665,6 +679,24 @@ def _json_data_units(product):
     return units
 
 
+def _primary_document_type(product):
+    """
+    The document_type EMA's (or any crawler's) own json_data states for the
+    SPECIFIC document that became this product's document_text/chunks —
+    matched by s3_path against drug.products.source_url, the same match
+    processing/text_extraction.py's _select_documents uses to pick documents
+    in the first place. Returns None if json_data has no documents[] entry
+    for it, or no document_type field at all — a genuine "don't know", which
+    the caller treats as "not confirmed to be the expected type" rather than
+    guessing.
+    """
+    source_url = product.get("source_url")
+    for d in (product.get("json_data") or {}).get("documents") or []:
+        if isinstance(d, dict) and d.get("s3_path") == source_url:
+            return d.get("document_type")
+    return None
+
+
 def _input_units(cursor, product):
     cursor.execute(
         "SELECT chunk_text FROM drug.product_chunks WHERE product_id = %s ORDER BY chunk_index",
@@ -672,15 +704,22 @@ def _input_units(cursor, product):
     )
     document_chunks = [row["chunk_text"] for row in cursor.fetchall()]
 
-    if document_chunks and product.get("country_name") in _SKIP_JSON_DATA_WHEN_DOCUMENT:
+    country = product.get("country_name")
+    if (document_chunks and country in _SKIP_JSON_DATA_WHEN_DOCUMENT
+            and _primary_document_type(product) == _EXPECTED_DOCUMENT_TYPE.get(country)):
         return document_chunks
 
     # json_data goes first: it's the structured "skeleton" (application
     # number, product table, approval dates, TE cross-references) that
     # document prose often doesn't restate, so the fold sees it before the
-    # narrative detail in document_chunks. Included whenever present, not
-    # only when document_chunks is empty — see module docstring and
-    # _SKIP_JSON_DATA_WHEN_DOCUMENT above for the one exception.
+    # narrative detail in document_chunks. Included whenever present — which
+    # now includes a European Union product whose chunked document ISN'T the
+    # standard "product_information" PDF (an assessment report, a variation
+    # notice, an older template extract_annex_iii doesn't recognise, or a
+    # record with no matching documents[] entry at all): that document isn't
+    # confirmed to restate the same facts json_data would, so it's included
+    # rather than assumed redundant. See _primary_document_type and
+    # _SKIP_JSON_DATA_WHEN_DOCUMENT above.
     return _json_data_units(product) + document_chunks
 
 
